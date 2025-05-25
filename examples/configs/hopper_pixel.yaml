@@ -1,0 +1,68 @@
+# Configuration for Hopper (harder environment)
+
+active_inference:
+  env_name: "Hopper-v4"
+  action_dim: 3
+  
+  # Active inference parameters
+  precision_init: 1.0
+  expected_free_energy_horizon: 3
+  epistemic_weight: 0.3  # Higher for unstable env
+  extrinsic_weight: 0.7
+  discount_factor: 0.99
+  
+  # Model architecture
+  hidden_dim: 256
+  latent_dim: 50
+  num_layers: 3
+  
+  # Training
+  batch_size: 128
+  learning_rate: 1e-4
+  gradient_clip: 0.5  # Lower for stability
+  
+  # Diffusion
+  diffusion:
+    num_diffusion_steps: 50
+    beta_start: 1e-4
+    beta_end: 0.02
+    beta_schedule: "cosine"
+    
+  # Belief dynamics
+  belief_dynamics:
+    use_belief_dynamics: true
+    diffusion_coefficient: 0.01  # Very low for stability
+    learning_rate: 0.01
+    dt: 0.01
+    use_full_covariance: false
+    min_variance: 1e-4
+    max_variance: 1.0
+
+pixel:
+  image_shape: [3, 84, 84]
+  frame_stack: 3
+  encoder_type: "drqv2"
+  encoder_feature_dim: 50
+  augmentation: true
+  random_shift_pad: 4
+
+training:
+  total_timesteps: 3_000_000
+  eval_frequency: 20_000
+  save_frequency: 100_000
+  log_frequency: 1_000
+  
+  exploration_noise: 0.3
+  exploration_decay: 0.995
+  min_exploration: 0.1
+  
+  buffer_size: 100_000
+  learning_starts: 10_000
+  train_frequency: 1
+  gradient_steps: 1
+  
+  num_eval_episodes: 10
+  
+  use_wandb: true
+  project_name: "active-inference-diffusion"
+  experiment_name: "hopper_pixel_stable"

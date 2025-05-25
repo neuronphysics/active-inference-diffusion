@@ -1,0 +1,111 @@
+"""
+Configuration module for Active Inference + Diffusion
+"""
+
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Any, Tuple
+import torch
+
+
+@dataclass
+class DiffusionConfig:
+    """Configuration for diffusion process"""
+    num_diffusion_steps: int = 100
+    beta_start: float = 1e-4
+    beta_end: float = 0.02
+    beta_schedule: str = "linear"  # linear, cosine, sigmoid
+    prediction_type: str = "score"  # score, noise, x0
+    
+    
+@dataclass
+class BeliefDynamicsConfig:
+    """Configuration for belief dynamics"""
+    use_belief_dynamics: bool = True
+    belief_dim: int = 50
+    diffusion_coefficient: float = 0.1
+    learning_rate: float = 0.1
+    dt: float = 0.01
+    min_variance: float = 1e-6
+    max_variance: float = 10.0
+    use_full_covariance: bool = False
+    noise_scale: float = 0.01
+    
+
+@dataclass
+class ActiveInferenceConfig:
+    """Main configuration for active inference"""
+    # Environment
+    env_name: str = "HalfCheetah-v4"
+    state_dim: int = 17
+    action_dim: int = 6
+    
+    # Active inference parameters
+    precision_init: float = 1.0
+    precision_learning_rate: float = 0.01
+    expected_free_energy_horizon: int = 5
+    epistemic_weight: float = 0.1
+    extrinsic_weight: float = 1.0
+    discount_factor: float = 0.99
+    
+    # Model architecture
+    hidden_dim: int = 256
+    latent_dim: int = 50
+    num_layers: int = 3
+    
+    # Training
+    batch_size: int = 256
+    learning_rate: float = 3e-4
+    gradient_clip: float = 1.0
+    
+    # Diffusion config
+    diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
+    
+    # Belief dynamics config
+    belief_dynamics: BeliefDynamicsConfig = field(default_factory=BeliefDynamicsConfig)
+    
+    # Device
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    def __post_init__(self):
+        """Post-initialization setup"""
+        self.belief_dynamics.belief_dim = self.latent_dim
+        
+
+@dataclass
+class PixelObservationConfig:
+    """Configuration for pixel observations"""
+    image_shape: Tuple[int, int, int] = (3, 84, 84)
+    frame_stack: int = 3
+    encoder_type: str = "drqv2"  # drqv2, impala, attention
+    encoder_feature_dim: int = 50
+    augmentation: bool = True
+    random_shift_pad: int = 4
+    
+
+@dataclass
+class TrainingConfig:
+    """Training configuration"""
+    # General
+    total_timesteps: int = 1_000_000
+    eval_frequency: int = 10_000
+    save_frequency: int = 50_000
+    log_frequency: int = 1_000
+    
+    # Exploration
+    exploration_noise: float = 0.1
+    exploration_decay: float = 0.999
+    min_exploration: float = 0.01
+    
+    # Buffer
+    buffer_size: int = 100_000
+    learning_starts: int = 10_000
+    train_frequency: int = 2
+    gradient_steps: int = 2
+    
+    # Evaluation
+    num_eval_episodes: int = 10
+    
+    # Logging
+    use_wandb: bool = True
+    project_name: str = "active-inference-diffusion"
+    experiment_name: Optional[str] = None

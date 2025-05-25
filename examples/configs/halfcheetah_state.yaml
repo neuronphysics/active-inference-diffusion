@@ -1,0 +1,57 @@
+active_inference:
+  env_name: "HalfCheetah-v4"
+  state_dim: 17
+  action_dim: 6
+  
+  # Active inference parameters
+  precision_init: 1.0
+  expected_free_energy_horizon: 5
+  epistemic_weight: 0.1
+  extrinsic_weight: 1.0
+  discount_factor: 0.99
+  
+  # Model architecture
+  hidden_dim: 256
+  latent_dim: 50
+  num_layers: 3
+  
+  # Training
+  batch_size: 256
+  learning_rate: 3e-4
+  gradient_clip: 1.0
+  
+  # Diffusion
+  diffusion:
+    num_diffusion_steps: 100
+    beta_start: 1e-4
+    beta_end: 0.02
+    beta_schedule: "linear"
+    
+  # Belief dynamics
+  belief_dynamics:
+    use_belief_dynamics: true
+    diffusion_coefficient: 0.1
+    learning_rate: 0.1
+    dt: 0.01
+    use_full_covariance: false
+
+training:
+  total_timesteps: 1_000_000
+  eval_frequency: 10_000
+  save_frequency: 50_000
+  log_frequency: 1_000
+  
+  exploration_noise: 0.1
+  exploration_decay: 0.999
+  min_exploration: 0.01
+  
+  buffer_size: 100_000
+  learning_starts: 10_000
+  train_frequency: 2
+  gradient_steps: 2
+  
+  num_eval_episodes: 10
+  
+  use_wandb: true
+  project_name: "active-inference-diffusion"
+  experiment_name: "halfcheetah_state_baseline"
