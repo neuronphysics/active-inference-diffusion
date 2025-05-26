@@ -12,7 +12,8 @@ from abc import ABC, abstractmethod
 import gymnasium as gym
 
 from ..core.active_inference import ActiveInferenceCore
-from ..encoders.visual_encoders import EncoderFactory, RandomShiftAugmentation
+from ..encoder.visual_encoders import RandomShiftAugmentation
+from ..encoder.state_encoders import StateEncoder, EncoderFactory
 from ..utils.buffers import ReplayBuffer
 from ..configs.config import (
     ActiveInferenceConfig,
@@ -146,9 +147,11 @@ class BaseActiveInferenceAgent(ABC):
         
         # Process batch
         states = self._process_batch_observations(batch['observations'])
+        states =self.active_inference.encoder(states).to(self.device)
         actions = batch['actions'].to(self.device)
         rewards = batch['rewards'].to(self.device)
         next_states = self._process_batch_observations(batch['next_observations'])
+        next_states = self.active_inference.encoder(next_states).to(self.device) 
         dones = batch['dones'].to(self.device)
         
         metrics = {}

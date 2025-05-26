@@ -33,6 +33,8 @@ class StateBasedAgent(BaseActiveInferenceAgent):
         # Update config
         self.config.state_dim = self.state_dim
         self.config.action_dim = self.action_dim
+        total_input_dim = self.state_dim + self.action_dim
+        print(f"dynamic input dimension: {total_input_dim}")
         
     def _build_models(self):
         """Build models for state-based observations"""
@@ -73,14 +75,25 @@ class StateBasedAgent(BaseActiveInferenceAgent):
         """Process batch of state observations"""
         return observations.to(self.device)
 
+    
 class StateActiveInference(ActiveInferenceCore):
-    """Active Inference for state observations"""
+    """Active Inference for state observations with proper encoding"""
     
     def __init__(self, encoder: nn.Module, **kwargs):
         super().__init__(**kwargs)
         self.encoder = encoder
         
     def encode_state(self, state: torch.Tensor) -> torch.Tensor:
-        """Encode state using provided encoder"""
-        return self.encoder(state)
+        """Encode state using provided encoder with dimension validation"""
+        # Apply encoder
+        encoded = self.encoder(state)
+        
+        # Validate dimensions
+        expected_dim = self.latent_dim
+        actual_dim = encoded.shape[-1]
+        
+        if actual_dim != expected_dim:
+            raise ValueError(f"Encoding dimension mismatch: expected {expected_dim}, got {actual_dim}")
+            
+        return encoded
 

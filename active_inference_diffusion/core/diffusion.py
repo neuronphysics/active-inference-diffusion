@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from typing import Tuple, Optional
 import numpy as np
-
+import torch.nn.functional as F
 
 class DiffusionProcess(nn.Module):
     """
@@ -24,11 +24,13 @@ class DiffusionProcess(nn.Module):
     def setup_schedule(self):
         """Initialize noise schedule β_t"""
         steps = self.config.num_diffusion_steps
+        beta_start = float(self.config.beta_start)
+        beta_end = float(self.config.beta_end)
         
         if self.config.beta_schedule == "linear":
             betas = torch.linspace(
-                self.config.beta_start,
-                self.config.beta_end,
+                beta_start,
+                beta_end,
                 steps
             )
         elif self.config.beta_schedule == "cosine":
@@ -153,6 +155,11 @@ class DiffusionProcess(nn.Module):
 def extract(a: torch.Tensor, t: torch.Tensor, x_shape: Tuple) -> torch.Tensor:
     """Extract coefficients at timestep t and reshape to broadcast"""
     batch_size = t.shape[0]
-    out = a.gather(-1, t.cpu())
-    return out.reshape(batch_size, *((1,) * (len(x_shape) - 1))).to(t.device)
+    t_indices = t.long()
+    if t_indices.device != a.device:
+        t_indices = t_indices.to(a.device)
+
+    out = a.gather(-1, t_indices)
+    broadcast_shape = [batch_size] + [1] * (len(x_shape) - 1)
+    return out.reshape(*broadcast_shape).to(t.device)
 

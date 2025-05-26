@@ -10,7 +10,7 @@ import torch
 @dataclass
 class DiffusionConfig:
     """Configuration for diffusion process"""
-    num_diffusion_steps: int = 100
+    num_diffusion_steps: int = 1000
     beta_start: float = 1e-4
     beta_end: float = 0.02
     beta_schedule: str = "linear"  # linear, cosine, sigmoid
@@ -30,7 +30,6 @@ class BeliefDynamicsConfig:
     use_full_covariance: bool = False
     noise_scale: float = 0.01
     
-
 @dataclass
 class ActiveInferenceConfig:
     """Main configuration for active inference"""
@@ -39,9 +38,8 @@ class ActiveInferenceConfig:
     state_dim: int = 17
     action_dim: int = 6
     
-    # Active inference parameters
+    # Active inference parameters  
     precision_init: float = 1.0
-    precision_learning_rate: float = 0.01
     expected_free_energy_horizon: int = 5
     epistemic_weight: float = 0.1
     extrinsic_weight: float = 1.0
@@ -57,10 +55,8 @@ class ActiveInferenceConfig:
     learning_rate: float = 3e-4
     gradient_clip: float = 1.0
     
-    # Diffusion config
+    # Nested configs (ADD THESE)
     diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
-    
-    # Belief dynamics config
     belief_dynamics: BeliefDynamicsConfig = field(default_factory=BeliefDynamicsConfig)
     
     # Device
@@ -69,7 +65,7 @@ class ActiveInferenceConfig:
     def __post_init__(self):
         """Post-initialization setup"""
         self.belief_dynamics.belief_dim = self.latent_dim
-        
+
 
 @dataclass
 class PixelObservationConfig:

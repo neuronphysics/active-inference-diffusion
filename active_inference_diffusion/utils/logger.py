@@ -6,8 +6,8 @@ import wandb
 from typing import Dict, Any, Optional
 import json
 from pathlib import Path
-
-
+import numpy as np
+import torch
 class Logger:
     """
     Unified logger supporting console, file, and wandb
@@ -38,16 +38,29 @@ class Logger:
         
     def log(self, metrics: Dict[str, Any], step: int):
         """Log metrics"""
-        # Add step to metrics
-        metrics['step'] = step
-        
+        processed_metrics = {}
+        for key, value in metrics.items():
+            # Handle PyTorch tensors
+            if isinstance(value, torch.Tensor):
+                if value.numel() == 1:  # Scalar tensor
+                    processed_metrics[key] = value.item()
+                else:
+                    processed_metrics[key] = value.cpu().detach().tolist()
+            # Handle numpy arrays (if any)
+            elif isinstance(value, np.ndarray):
+                processed_metrics[key] = value.tolist()
+            else:
+                processed_metrics[key] = value
+    
+        processed_metrics['step'] = step
+    
         # Log to wandb
         if self.use_wandb:
-            wandb.log(metrics, step=step)
-            
+            wandb.log(processed_metrics, step=step)
+    
         # Log to file
         with open(self.log_file, 'a') as f:
-            f.write(json.dumps(metrics) + '\n')
+            f.write(json.dumps(processed_metrics) + '\n')
             
     def log_video(self, video: np.ndarray, caption: str, step: int):
         """Log video to wandb"""

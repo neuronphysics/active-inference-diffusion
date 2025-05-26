@@ -4,7 +4,7 @@ Value network implementations
 
 import torch
 import torch.nn as nn
-
+from active_inference_diffusion.models.score_networks import SinusoidalPositionEmbeddings
 
 class ValueNetwork(nn.Module):
     """
