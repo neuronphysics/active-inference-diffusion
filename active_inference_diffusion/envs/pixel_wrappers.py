@@ -100,10 +100,23 @@ class MuJoCoPixelObservationWrapper(gym.ObservationWrapper):
     
     def _render_pixels(self) -> np.ndarray:
         """Render pixels using appropriate method based on environment type."""
+        # Navigate to the base MuJoCo environment through wrapper chain
+        base_env = self.env
+        while hasattr(base_env, 'env'):
+            base_env = base_env.env
         
+        # Alternative unwrapped access for gymnasium environments
+        if hasattr(self.env, 'unwrapped'):
+            base_env = self.env.unwrapped
+    
         if self._render_mode == 'gymnasium':
-            # Modern gymnasium approach
-            pixels = self.env.mujoco_renderer.render(
+            # Modern gymnasium approach - use base environment's renderer
+            if self.camera_name is not None:
+                # Set camera before rendering
+                if hasattr(base_env, 'mujoco_renderer') and hasattr(base_env.mujoco_renderer, 'camera_name'):
+                    base_env.mujoco_renderer.camera_name = self.camera_name
+
+            pixels = base_env.mujoco_renderer.render(
                 render_mode='rgb_array',
                 camera_name=self.camera_name,
                 width=self.width,
@@ -112,34 +125,34 @@ class MuJoCoPixelObservationWrapper(gym.ObservationWrapper):
         else:
             # Legacy mujoco-py approach
             if self.camera_name is None:
-                pixels = self.env.unwrapped.sim.render(
+                pixels = base_env.sim.render(
                     width=self.width,
                     height=self.height,
                     mode='offscreen',
                     device_id=self.device_id
                 )
             else:
-                pixels = self.env.unwrapped.sim.render(
+                pixels = base_env.sim.render(
                     width=self.width,
                     height=self.height,
                     camera_name=self.camera_name,
                     mode='offscreen',
                     device_id=self.device_id
                 )
-        
+    
         # Flip vertically (OpenGL convention)
         pixels = pixels[::-1, :, :]
-        
+    
         # Convert to channels-first if requested
         if self.channels_first and pixels.shape[2] == 3:
             pixels = np.transpose(pixels, (2, 0, 1))
-        
+    
         # Normalize if requested
         if self.normalize:
             pixels = pixels.astype(np.float32) / 255.0
         else:
             pixels = pixels.astype(np.uint8)
-            
+        
         return pixels
     
     def reset(self, **kwargs) -> Tuple[np.ndarray, Dict[str, Any]]:
@@ -242,6 +255,9 @@ class MultiCameraWrapper(gym.ObservationWrapper):
 
 
 # Convenience functions for common MuJoCo environments
+
+from .wrappers import ActionRepeat  # Add this import at the top of the file
+
 def make_pixel_mujoco(
     env_id: str,
     width: int = 84,
@@ -255,32 +271,40 @@ def make_pixel_mujoco(
     """
     Create a pixel-based MuJoCo environment with common wrappers.
     
+    This function orchestrates a hierarchical wrapper composition that transforms
+    raw MuJoCo state-based environments into pixel-observation spaces suitable
+    for visual control learning paradigms.
+    
     Args:
-        env_id: MuJoCo environment ID
-        width: Image width
-        height: Image height
-        frame_stack: Number of frames to stack
-        action_repeat: Number of times to repeat each action
-        seed: Random seed
-        **kwargs: Additional arguments for MuJoCoPixelObservationWrapper
+        env_id: MuJoCo environment identifier
+        width: Rendered observation width (pixels)
+        height: Rendered observation height (pixels)
+        frame_stack: Temporal context via frame concatenation
+        action_repeat: Temporal action persistence factor
+        camera_name: MuJoCo camera perspective identifier
+        seed: Stochastic initialization seed
+        **kwargs: Additional MuJoCoPixelObservationWrapper parameters
         
     Returns:
-        Wrapped environment ready for pixel-based training
+        Hierarchically wrapped environment with pixel observations
     """
     # Create base environment
     env = gym.make(env_id)
     
     # Set seed if provided
     if seed is not None:
-        env.rest(seed=seed)
+        env.reset(seed=seed)
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
     
     # Add action repeat wrapper if requested
+    # This implements temporal action persistence, reducing control frequency
+    # while maintaining physics simulation fidelity
     if action_repeat > 1:
-        env = gym.wrappers.RepeatAction(env, action_repeat)
+        env = ActionRepeat(env, repeat=action_repeat)  # Use your custom wrapper
     
     # Add pixel observation wrapper
+    # Transforms proprioceptive state space to visual observation space
     env = MuJoCoPixelObservationWrapper(
         env,
         width=width,
@@ -290,53 +314,8 @@ def make_pixel_mujoco(
     )
     
     # Add frame stacking if requested
+    # Provides temporal context through observation history
     if frame_stack > 1:
-        env = gym.wrappers.FrameStack(env, frame_stack)
+        env = gym.wrappers.FrameStackObservation(env, frame_stack)
     
     return env
-
-
-# Example usage and testing
-if __name__ == "__main__":
-    # Test with different MuJoCo environments
-    env_ids = ["HalfCheetah-v4", "Hopper-v4", "Walker2d-v4", "Ant-v4"]
-    
-    for env_id in env_ids:
-        print(f"\nTesting {env_id}...")
-        
-        # Create pixel-based environment
-        env = make_pixel_mujoco(
-            env_id,
-            width=84,
-            height=84,
-            frame_stack=3,
-            camera_name="track" if "Ant" in env_id else None
-        )
-        
-        # Test reset
-        obs, info = env.reset()
-        print(f"Observation shape: {obs.shape}")
-        print(f"Observation dtype: {obs.dtype}")
-        
-        # Test step
-        action = env.action_space.sample()
-        obs, reward, terminated, truncated, info = env.step(action)
-        print(f"Reward: {reward}")
-        print(f"Info keys: {list(info.keys())}")
-        
-        # Test multi-camera wrapper
-        env_multi = gym.make(env_id)
-        env_multi = MultiCameraWrapper(
-            env_multi,
-            camera_configs={
-                'front': {'width': 64, 'height': 64},
-                'side': {'width': 64, 'height': 64},
-                'track': {'width': 84, 'height': 84}
-            }
-        )
-        
-        obs_multi, _ = env_multi.reset()
-        print(f"Multi-camera observations: {list(obs_multi.keys())}")
-        
-        env.close()
-        env_multi.close()

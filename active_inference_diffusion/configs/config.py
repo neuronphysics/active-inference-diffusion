@@ -13,9 +13,9 @@ class DiffusionConfig:
     num_diffusion_steps: int = 1000
     beta_start: float = 1e-4
     beta_end: float = 0.02
-    beta_schedule: str = "linear"  # linear, cosine, sigmoid
-    prediction_type: str = "score"  # score, noise, x0
-    
+    beta_schedule: str = "linear"
+    prediction_type: str = "score"
+    latent_dim: int = 50  
     
 @dataclass
 class BeliefDynamicsConfig:
@@ -32,19 +32,26 @@ class BeliefDynamicsConfig:
     
 @dataclass
 class ActiveInferenceConfig:
-    """Main configuration for active inference"""
+    """Enhanced configuration for diffusion active inference"""
     # Environment
     env_name: str = "HalfCheetah-v4"
-    state_dim: int = 17
+    observation_dim: int = 17  # Add this field
     action_dim: int = 6
     
     # Active inference parameters  
     precision_init: float = 1.0
     expected_free_energy_horizon: int = 5
+    efe_horizon: int = 5  # Alias for compatibility
     epistemic_weight: float = 0.1
     extrinsic_weight: float = 1.0
+    pragmatic_weight: float = 1.0  # 
+    consistency_weight: float = 0.1  # latent policy coherence
     discount_factor: float = 0.99
-    
+    contrastive_weight: float = 0.5  # for latent policy coherence
+    # Diffusion integration
+    kl_weight: float = 0.1  # kl regularization for diffusion
+    diffusion_weight: float = 1.0  # score matching weight
+    reward_weight:float = 0.5  # reward scaling
     # Model architecture
     hidden_dim: int = 256
     latent_dim: int = 50
@@ -55,17 +62,12 @@ class ActiveInferenceConfig:
     learning_rate: float = 3e-4
     gradient_clip: float = 1.0
     
-    # Nested configs (ADD THESE)
+    # Nested configs
     diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
     belief_dynamics: BeliefDynamicsConfig = field(default_factory=BeliefDynamicsConfig)
     
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    def __post_init__(self):
-        """Post-initialization setup"""
-        self.belief_dynamics.belief_dim = self.latent_dim
-
 
 @dataclass
 class PixelObservationConfig:

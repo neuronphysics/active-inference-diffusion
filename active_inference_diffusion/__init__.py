@@ -11,15 +11,15 @@ from .configs.config import (
 )
 
 from .agents import (
-    StateBasedAgent,
-    PixelBasedAgent,
+    DiffusionPixelAgent,
+    DiffusionStateAgent,
     BaseActiveInferenceAgent
 )
 
 from .core import (
-    ActiveInferenceCore,
+    DiffusionActiveInference,
+    LatentDiffusionProcess,
     BeliefDynamics,
-    DiffusionProcess,
     FreeEnergyComputation
 )
 
@@ -34,13 +34,13 @@ __all__ = [
     "BeliefDynamicsConfig",
     
     # Agents
-    "StateBasedAgent",
-    "PixelBasedAgent",
+    "DiffusionPixelAgent",
+    "DiffusionStateAgent",
     "BaseActiveInferenceAgent",
     
     # Core
-    "ActiveInferenceCore",
+    "DiffusionActiveInference",
+    "LatentDiffusionProcess",
     "BeliefDynamics",
-    "DiffusionProcess",
     "FreeEnergyComputation",
 ]

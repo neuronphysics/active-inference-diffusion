@@ -1,43 +1,34 @@
 """
-Core Active Inference implementation with Diffusion Models
+Active Inference with Diffusion-Generated Latent Spaces
 """
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from typing import Dict, Tuple, Optional, List
-import math
-import warnings
+from ..configs import ActiveInferenceConfig
 
-from .belief_dynamics import BeliefDynamics
-from .diffusion import DiffusionProcess
-from .free_energy import FreeEnergyComputation
-from ..configs.config import ActiveInferenceConfig
-
-class ActiveInferenceCore(nn.Module):
+class DiffusionActiveInference(nn.Module):
     """
-    Core Active Inference implementation combining:
-    - Variational Free Energy minimization
-    - Expected Free Energy for action selection
-    - Diffusion models for generative modeling
-    - Fokker-Planck belief dynamics
+    Core Active Inference implementation with diffusion-generated latents
     
-    Enhanced with:
-    - Proper score matching training
-    - Numerical stability improvements
-    - Computational graph preservation
+    Key innovations:
+    - Latent beliefs emerge from reverse diffusion process
+    - Policies conditioned on continuous latent manifolds
+    - Expected Free Energy computed over diffusion trajectories
     """
     
     def __init__(
         self,
-        state_dim: int,
+        observation_dim: int,
         action_dim: int,
         latent_dim: int,
         config: 'ActiveInferenceConfig'
     ):
         super().__init__()
         
-        self.state_dim = state_dim
+        self.observation_dim = observation_dim
         self.action_dim = action_dim
         self.latent_dim = latent_dim
         self.config = config
@@ -45,307 +36,233 @@ class ActiveInferenceCore(nn.Module):
         # Initialize components
         self._build_models()
         
-        # Belief dynamics with enhanced stability
-        self.belief_dynamics = BeliefDynamics(
-            latent_dim=latent_dim,
-            config=config.belief_dynamics
-        )
-        
-        # Diffusion process
-        self.diffusion = DiffusionProcess(config.diffusion)
-        
-        # Free energy computation
-        self.free_energy = FreeEnergyComputation(
-            precision_init=config.precision_init
-        )
-        
-        # Time tracking
-        self.current_time = 0.0
-        
-        # Training state tracking
-        self.training_step = 0
+        # Current belief state (diffusion-generated)
+        self.current_latent = None
+        self.latent_trajectory = []
         
     def _build_models(self):
-        """Build neural network models with enhanced initialization"""
-        # Score network: s_θ(z,t,π) = ∇_z log p_t(z|π)
-        from ..models.score_networks import ScoreNetwork
-        self.score_network = ScoreNetwork(
+        """Build core models for diffusion active inference"""
+        
+        # Latent diffusion process
+        from .diffusion import LatentDiffusionProcess
+        self.latent_diffusion = LatentDiffusionProcess(self.config.diffusion)
+        
+        # Score network for latent generation
+        from ..models.score_networks import LatentScoreNetwork
+        self.latent_score_network = LatentScoreNetwork(
+            latent_dim=self.latent_dim,
+            observation_dim=self.observation_dim,
+            hidden_dim=self.config.hidden_dim,
+            use_attention=True
+        )
+        
+        # Policy network conditioned on diffusion latents
+        from ..models.policy_networks import DiffusionConditionedPolicy
+        self.policy_network = DiffusionConditionedPolicy(
+            latent_dim=self.latent_dim,
+            action_dim=self.action_dim,
+            hidden_dim=self.config.hidden_dim,
+            use_state_dependent_std=True
+        )
+        
+        # Value network for latent states
+        from ..models.value_networks import ValueNetwork
+        self.value_network = ValueNetwork(
+            state_dim=self.latent_dim,  # Using latent dimension as state dimension
+            hidden_dim=self.config.hidden_dim,
+            time_embed_dim=128,  # Time embedding dimension
+            num_layers=3
+     )
+        
+        # Dynamics model in latent space
+        from ..models.dynamics_models import LatentDynamicsModel
+        self.latent_dynamics = LatentDynamicsModel(
             state_dim=self.latent_dim,
             action_dim=self.action_dim,
             hidden_dim=self.config.hidden_dim,
-            time_embed_dim=self.config.hidden_dim
+            num_layers=3
         )
         
-        # Enhanced initialization for score network
-        self._initialize_score_network()
-        
-        # Policy network: π(a|s)
-        from ..models.policy_networks import GaussianPolicy
-        self.policy_network = GaussianPolicy(
-            state_dim=self.latent_dim,
-            action_dim=self.action_dim,
-            hidden_dim=self.config.hidden_dim
-        )
-        
-        # Value network: V(s,t)
-        from ..models.value_networks import ValueNetwork
-        self.value_network = ValueNetwork(
-            state_dim=self.latent_dim,
-            hidden_dim=self.config.hidden_dim
-        )
-        
-        # Dynamics model: f(s,a) -> s'
-        from ..models.dynamics_models import LatentDynamicsModel
-        self.dynamics_model = LatentDynamicsModel(
-            state_dim=self.latent_dim,
-            action_dim=self.action_dim,
-            hidden_dim=self.config.hidden_dim
-        )
-        
-        # Reward predictor: r(s,a)
+        # Observation decoder (latent -> observation prediction)
+        self.observation_decoder = nn.ModuleList([
+            nn.Sequential(
+            nn.Linear(self.latent_dim, self.config.hidden_dim * 2),
+            nn.LayerNorm(self.config.hidden_dim * 2),
+            nn.SiLU(),
+        ),
+            nn.Sequential(
+            nn.Linear(self.config.hidden_dim * 2, self.config.hidden_dim * 2),
+            nn.LayerNorm(self.config.hidden_dim * 2),
+            nn.SiLU(),
+        ),
+            nn.Sequential(
+            nn.Linear(self.config.hidden_dim * 2, self.config.hidden_dim),
+            nn.LayerNorm(self.config.hidden_dim),
+            nn.SiLU(),
+        ),
+        nn.Linear(self.config.hidden_dim, self.observation_dim)
+        ])
+        #initialize a reward predictor
         self.reward_predictor = nn.Sequential(
-            nn.Linear(self.latent_dim + self.action_dim, self.config.hidden_dim),
+            nn.Linear(self.latent_dim, self.config.hidden_dim),
+            nn.LayerNorm(self.config.hidden_dim),
             nn.ReLU(),
-            nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
+            nn.Linear(self.config.hidden_dim, self.config.hidden_dim // 2),
             nn.ReLU(),
-            nn.Linear(self.config.hidden_dim, 1)
+            nn.Linear(self.config.hidden_dim // 2, 2)
         )
-        
-    def _initialize_score_network(self):
-        """Enhanced initialization for score network to prevent vanishing gradients"""
-        # Use Xavier initialization for internal layers
-        for name, param in self.score_network.named_parameters():
-            if 'weight' in name and len(param.shape) > 1:
-                if 'network' in name and 'weight' in name:
-                    # Use small random initialization for output layer
-                    if name.endswith('network.-1.weight'):
-                        nn.init.normal_(param, mean=0.0, std=1e-4)
-                    else:
-                        nn.init.xavier_uniform_(param)
-            elif 'bias' in name:
-                nn.init.zeros_(param)
+
+    def decode_observation(self, latent: torch.Tensor) -> torch.Tensor:
+        """Enhanced decoding with residual connections"""
+        h = latent
     
-    def encode_state(self, state: torch.Tensor) -> torch.Tensor:
-        """
-        Encode state to latent representation
-        Override in subclasses for different observation types
-        """
-        return NotImplementedError
+        # First layer
+        h1 = self.observation_decoder[0](h)
     
-    def train_score_network(
-        self, 
-        states: torch.Tensor, 
-        actions: torch.Tensor,
-        timesteps: Optional[torch.Tensor] = None
-    ) -> Dict[str, float]:
-        """
-        Proper score matching training for diffusion-active inference integration
+        # Second layer with skip
+        h2 = self.observation_decoder[1](h1)
+        h2 = h2 + h1  # Skip connection
+    
+        # Third layer
+        h3 = self.observation_decoder[2](h2)
+    
+        # Output layer
+        return self.observation_decoder[3](h3)
         
-        Implements denoising score matching: L = E[||s_θ(x_t,t,π) + ε/√(1-ᾱ_t)||²]
-        """
-        batch_size = states.shape[0]
-        device = states.device
-        
-        # Sample random timesteps if not provided
-        if timesteps is None:
-            timesteps = torch.randint(
-                0, self.diffusion.config.num_diffusion_steps, 
-                (batch_size,), device=device
-            )
-        
-        # Sample noise
-        noise = torch.randn_like(states)
-        
-        # Forward diffusion: x_t = √(ᾱ_t) * x_0 + √(1 - ᾱ_t) * ε
-        noisy_states = self.diffusion.q_sample(states, timesteps, noise)
-        
-        # Predict score
-        predicted_score = self.score_network(noisy_states, timesteps.float(), actions)
-        
-        # True score: -ε / √(1 - ᾱ_t)
-        alphas_cumprod_t = self.diffusion.sqrt_one_minus_alphas_cumprod[timesteps]
-        true_score = -noise / alphas_cumprod_t.view(-1, 1)
-        
-        # Score matching loss
-        score_loss = F.mse_loss(predicted_score, true_score)
-        
-        return {
-            'score_matching_loss': score_loss.item(),
-            'mean_predicted_norm': predicted_score.norm(dim=-1).mean().item(),
-            'mean_true_norm': true_score.norm(dim=-1).mean().item()
-        }
-        
-    def update_belief(
+    def update_belief_via_diffusion(
         self,
-        observation: torch.Tensor,
-        action: Optional[torch.Tensor] = None
+        observation: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
         """
-        Update belief distribution using Fokker-Planck dynamics
-        
-        dq(z|π)/dt = ∇·(D∇q) + ∇·(qF_π)
+        Update belief using reverse diffusion process
+        This is the core innovation - beliefs as diffusion-generated latents
         """
-        # Encode observation
-        z_obs = self.encode_state(observation)
+        batch_size = observation.shape[0] if observation.dim() > 1 else 1
         
-        # Get current belief
-        belief_mean, belief_cov = self.belief_dynamics.get_parameters()
+        if observation.dim() == 1:
+            observation = observation.unsqueeze(0)
+            
+        # Generate latent via reverse diffusion conditioned on observation
+        trajectory = self.latent_diffusion.generate_latent_trajectory(
+            score_network=self.latent_score_network,
+            batch_size=batch_size,
+            observation=observation,
+            deterministic=False
+        )
         
-        # Compute score at belief mean
-        t = torch.tensor([self.current_time], device=observation.device)
+        # Final latent is the belief
+        self.current_latent = trajectory[-1]
+        self.latent_trajectory = trajectory
         
-        if action is None:
-            # Use policy to get action if not provided
-            with torch.no_grad():
-                action_dist = self.policy_network(belief_mean.unsqueeze(0))
-                action = action_dist.mean.squeeze(0)
-        else:
-            # Ensure proper dimensionality
-            if action.dim() > 1:
-                action = action.squeeze(0)
+        # Compute latent statistics
+        latent_mean = self.current_latent.mean(dim=0)
+        latent_std = self.current_latent.std(dim=0)
         
-        score = self.score_network(
-            belief_mean.unsqueeze(0),
-            t,
-            action.unsqueeze(0)
-        ).squeeze(0)
-        
-        # Update belief with numerical stability checks
-        try:
-            new_mean, new_cov = self.belief_dynamics.update(
-                observation=z_obs,
-                score_function=score,
-                action=action
-            )
-        except RuntimeError as e:
-            warnings.warn(f"Belief update failed: {e}, resetting to prior")
-            self.belief_dynamics.reset()
-            new_mean, new_cov = self.belief_dynamics.get_parameters()
-        
-        # Update time
-        self.current_time += self.config.belief_dynamics.dt
+        # Decode to observation space for validation
+        predicted_obs = self.decode_observation(self.current_latent)
+        reconstruction_error = F.mse_loss(predicted_obs, observation)
         
         return {
-            'belief_mean': new_mean,
-            'belief_covariance': new_cov,
-            'belief_entropy': self.belief_dynamics.entropy(),
-            'observation_latent': z_obs
+            'latent': self.current_latent,
+            'latent_mean': latent_mean,
+            'latent_std': latent_std,
+            'trajectory_length': len(trajectory),
+            'reconstruction_error': reconstruction_error,
+            'observation': observation
         }
         
-    def compute_expected_free_energy(
+    def compute_expected_free_energy_diffusion(
         self,
-        state: torch.Tensor,
-        horizon: Optional[int] = None
+        latent: torch.Tensor,
+        horizon: int = 5,
+        num_trajectories: int = 16
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        Compute expected free energy G(π) for action selection
+        Enhanced Expected Free Energy over diffusion-generated trajectories
         
-        G(π) = E_q[D_KL[q(o_τ|π)||p(o_τ)] + E_q[H[p(o_τ|s_τ)]]]
-             = Risk + Ambiguity
-             = -Extrinsic Value + Epistemic Value
+        G(π) = E_z~p_θ(z) E_q(s'|s,π) [D_KL[q(o'|s')||p(o')] - log p_φ(π|z)]
         """
-        if horizon is None:
-            horizon = self.config.expected_free_energy_horizon
-            
-        batch_size = state.shape[0]
-        device = state.device
+        device = latent.device
+        batch_size = latent.shape[0]
         
-        # Initialize
+        # Initialize accumulators
         total_efe = torch.zeros(batch_size, device=device)
         epistemic_values = []
-        extrinsic_values = []
+        pragmatic_values = []
+        latent_consistency = []
         
-        current_state = state
-        discount = 1.0
-        
-        for step in range(horizon):
-            # Sample action from policy
-            action_dist = self.policy_network(current_state)
-            action = action_dist.rsample()
+        # Generate future latent trajectories
+        for traj_idx in range(num_trajectories):
+            current_latent = latent.clone()
+            traj_efe = 0
             
-            # Predict next state
-            next_state = self.dynamics_model(current_state, action)
+            for t in range(horizon):
+                # Sample policy from current latent
+                action, log_prob, policy_dist = self.policy_network(current_latent)
+                
+                # Predict next latent
+                next_latent = self.predict_next_latent(current_latent, action)
+                
+                # Epistemic value: Information gain about latent dynamics
+                latent_kl = self._compute_latent_kl(current_latent, next_latent)
+                epistemic = torch.log1p(latent_kl)  # Bounded transformation
+                
+                # Pragmatic value: Expected value under policy
+                time_tensor = torch.full((batch_size,), float(t), device=device)
+                value = self.value_network(next_latent, time_tensor).squeeze(-1)
+                pragmatic = value
+                
+                # Latent consistency: Policy entropy conditioned on latent
+                consistency = -policy_dist.entropy().sum(dim=-1)
+                
+                # Accumulate EFE
+                step_efe = (
+                    self.config.epistemic_weight * epistemic +
+                    self.config.pragmatic_weight * pragmatic +
+                    self.config.consistency_weight * consistency
+                )
+                
+                traj_efe += (self.config.discount_factor ** t) * step_efe
+                
+                # Update for next step
+                current_latent = next_latent
+                
+            total_efe += traj_efe / num_trajectories
             
-            # Enhanced epistemic value computation (computationally efficient)
-            epistemic = self._compute_epistemic_value_efficient(
-                current_state, next_state, action
-            )
-            
-            # Extrinsic value (expected reward)
-            extrinsic = self._compute_extrinsic_value(
-                current_state, action, next_state
-            )
-            
-            # Accumulate EFE
-            step_efe = (
-                self.config.epistemic_weight * epistemic -
-                self.config.extrinsic_weight * extrinsic
-            )
-            
-            total_efe += discount * step_efe
-            
-            # Store for logging
+            # Store components for analysis
             epistemic_values.append(epistemic)
-            extrinsic_values.append(extrinsic)
-            
-            # Update state and discount
-            current_state = next_state
-            discount *= self.config.discount_factor
+            pragmatic_values.append(pragmatic)
+            latent_consistency.append(consistency)
             
         info = {
-            'epistemic_values': torch.stack(epistemic_values),
-            'extrinsic_values': torch.stack(extrinsic_values),
+            'epistemic_mean': torch.stack(epistemic_values).mean(),
+            'pragmatic_mean': torch.stack(pragmatic_values).mean(),
+            'consistency_mean': torch.stack(latent_consistency).mean(),
+            'num_trajectories': num_trajectories,
             'horizon': horizon
         }
         
         return total_efe, info
-    
-    def _compute_epistemic_value_efficient(
+        
+    def predict_next_latent(
         self,
-        state: torch.Tensor,
-        next_state: torch.Tensor,
+        latent: torch.Tensor,
         action: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Efficient epistemic value computation using score network variance
-        Avoids expensive gradient computations
-        """
-        t = torch.zeros(state.shape[0], device=state.device)
+        """Predict next latent state using learned dynamics"""
+        delta = self.latent_dynamics(latent, action)
+        return latent + delta  # Residual connection
         
-        # Compute score at current and next states
-        with torch.no_grad():
-            score_current = self.score_network(state, t, action)
-            score_next = self.score_network(next_state, t, action)
-            
-            # Information gain approximated by score difference magnitude
-            score_change = torch.norm(score_next - score_current, dim=-1)
-            
-            # Higher score change indicates higher information gain
-            epistemic_value = torch.tanh(score_change)  # Bounded between 0 and 1
-            
-        return epistemic_value
-        
-    def _compute_extrinsic_value(
+    def _compute_latent_kl(
         self,
-        state: torch.Tensor,
-        action: torch.Tensor,
-        next_state: torch.Tensor
+        latent1: torch.Tensor,
+        latent2: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Compute extrinsic value (expected reward + future value)
-        """
-        # Predict immediate reward
-        state_action = torch.cat([state, action], dim=-1)
-        reward = self.reward_predictor(state_action).squeeze(-1)
-        
-        # Predict future value
-        t = torch.zeros(next_state.shape[0], device=next_state.device)
-        future_value = self.value_network(next_state, t).squeeze(-1)
-        
-        # Total extrinsic value
-        extrinsic_value = reward + self.config.discount_factor * future_value
-        
-        return extrinsic_value
+        """KL divergence between latent distributions"""
+        # Assume Gaussian with unit variance for simplicity
+        # Can be extended to learned variances
+        kl = 0.5 * torch.sum((latent1 - latent2) ** 2, dim=-1)
+        return kl
         
     def act(
         self,
@@ -353,163 +270,177 @@ class ActiveInferenceCore(nn.Module):
         deterministic: bool = False
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        Select action based on active inference principles
-        Enhanced with proper tensor handling and computational graph preservation
+        Select action using diffusion-generated latent active inference
         """
-        # Update belief with observation
-        belief_info = self.update_belief(observation)
+        # Update belief via diffusion
+        belief_info = self.update_belief_via_diffusion(observation)
         
-        # Use belief mean for action selection
-        state = belief_info['belief_mean'].unsqueeze(0)
+        # Current latent belief
+        latent = belief_info['latent']
         
         # Compute expected free energy
-        efe, efe_info = self.compute_expected_free_energy(state)
+        efe, efe_info = self.compute_expected_free_energy_diffusion(
+            latent,
+            horizon=self.config.efe_horizon
+        )
         
-        # Select action using policy
-        action_dist = self.policy_network(state)
+        # Get action from policy conditioned on latent
+        action, log_prob, policy_dist = self.policy_network(
+            latent,
+            deterministic=deterministic
+        )
         
-        if deterministic:
-            action = action_dist.mean
-        else:
-            action = action_dist.rsample()
-            
-        # Bound action
-        action = torch.tanh(action)
-        
-        # Enhanced info preparation with proper tensor handling
+        # Compile information
         info = {
-            'expected_free_energy': efe.item() if efe.dim() == 0 else efe.mean().item(),
-            'belief_entropy': belief_info['belief_entropy'].item(),
-            # Preserve computational graph for training
-            'action_mean': action_dist.mean,
-            'action_std': action_dist.stddev,
-            'belief_mean': belief_info['belief_mean'],
-            'belief_covariance': belief_info['belief_covariance'],
-            'observation_latent': belief_info['observation_latent'],
-            # Fixed tensor stacking issue
-            'epistemic_values': efe_info['epistemic_values'],  # Already stacked
-            'extrinsic_values': efe_info['extrinsic_values'],  # Already stacked
-            'horizon': efe_info['horizon']
+            **belief_info,
+            'expected_free_energy': efe.mean().item(),
+            'action_log_prob': log_prob.mean().item(),
+            'policy_entropy': policy_dist.entropy().sum(dim=-1).mean().item(),
+            **efe_info
         }
         
         return action, info
         
-    def compute_free_energy_loss(
+    def compute_diffusion_elbo(
         self,
-        states: torch.Tensor,
         observations: torch.Tensor,
-        actions: torch.Tensor
+        rewards: torch.Tensor,
+        latents: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        Compute variational free energy loss for training
-        Enhanced with proper score matching integration
+        Modified ELBO for diffusion-generated latent active inference
+        
+        L = E_q(z|o,π)[log p(o|z)] - D_KL[q(z|o,π)||p_θ(z)] + R_diffusion(θ)
         """
-        # Standard free energy computation
-        free_energy, fe_info = self.free_energy.compute_loss(
-            states, observations, actions,
-            score_network=self.score_network,
-            current_time=self.current_time
+        batch_size = observations.shape[0]
+        device = observations.device
+        
+        # Generate latents if not provided
+        if latents is None:
+            # Use current belief generation
+            belief_info = self.update_belief_via_diffusion(observations)
+            latents = belief_info['latent']
+            
+        # Reconstruction term
+        predicted_obs = self.observation_decoder(latents)
+        reconstruction_loss = F.mse_loss(predicted_obs, observations)
+        
+        # KL term against diffusion prior
+        prior_latents = self.latent_diffusion.sample_latent_prior(batch_size, device)
+        kl_loss = self._compute_latent_kl(latents, prior_latents).mean()
+        
+        # Diffusion score matching loss
+        t = torch.randint(0, self.config.diffusion.num_diffusion_steps,
+                         (batch_size,), device=device)
+        noise = torch.randn_like(latents)
+        noisy_latents, _ = self.latent_diffusion.q_sample(latents, t, noise)
+        
+        predicted_score = self.latent_score_network(
+            noisy_latents,
+            t.float(),
+            observations
         )
+        # Add reward prediction loss if rewards provided
+        predicted_rewards = self.reward_predictor(latents)
+        rewards_mean =predicted_rewards[:, 0]
+        rewards_std = torch.exp(torch.clamp(predicted_rewards[:, 1],min=-10, max=3))
+        rewards_distribution = torch.distributions.Normal(rewards_mean, rewards_std)
+        reward_loss = -rewards_distribution.log_prob(rewards).mean()
+        # True score
+        sqrt_one_minus_alpha = extract(
+            self.latent_diffusion.sqrt_one_minus_alphas_cumprod,
+            t,
+            latents.shape
+        )
+        true_score = -noise / sqrt_one_minus_alpha
         
-        # Add proper score matching loss
-        score_metrics = self.train_score_network(states, actions)
+        score_matching_loss = F.mse_loss(predicted_score, true_score)
         
-        # Combine losses
-        total_loss = free_energy + 0.1 * torch.tensor(score_metrics['score_matching_loss'], requires_grad=True)
-        
-        # Enhanced info
-        enhanced_info = {
-            **fe_info,
-            'score_matching_loss': score_metrics['score_matching_loss'],
-            'total_enhanced_loss': total_loss.item()
-        }
-        
-        return total_loss, enhanced_info
-        
-    def train_dynamics(
-        self,
-        states: torch.Tensor,
-        actions: torch.Tensor,
-        next_states: torch.Tensor,
-        rewards: torch.Tensor
-    ) -> Dict[str, float]:
-        """Train dynamics model and reward predictor with enhanced monitoring"""
-        # Dynamics prediction loss
-        predicted_next_states = self.dynamics_model(states, actions)
-        dynamics_loss = F.mse_loss(predicted_next_states, next_states)
-        
-        # Reward prediction loss
-        state_action = torch.cat([states, actions], dim=-1)
-        predicted_rewards = self.reward_predictor(state_action).squeeze(-1)
-        reward_loss = F.mse_loss(predicted_rewards, rewards)
-        
-        total_loss = dynamics_loss + reward_loss
-        
-        # Enhanced monitoring
-        dynamics_error = (predicted_next_states - next_states).abs().mean()
-        reward_error = (predicted_rewards - rewards).abs().mean()
-        
-        return {
-            'dynamics_loss': dynamics_loss.item(),
+        # Total ELBO
+        elbo = -reconstruction_loss + self.config.kl_weight * kl_loss + \
+               self.config.diffusion_weight * score_matching_loss - \
+               self.config.reward_weight * reward_loss
+               
+        info = {
+            'reconstruction_loss': reconstruction_loss.item(),
+            'kl_loss': kl_loss.item(),
+            'score_matching_loss': score_matching_loss.item(),
+            'elbo': elbo.item(),
             'reward_loss': reward_loss.item(),
-            'total_loss': total_loss.item(),
-            'dynamics_mae': dynamics_error.item(),
-            'reward_mae': reward_error.item()
         }
         
-    def update_value_function(
+        return -elbo, info  # Return negative ELBO as loss
+
+    def compute_lambda_returns(
         self,
-        states: torch.Tensor,
         rewards: torch.Tensor,
-        next_states: torch.Tensor,
-        dones: torch.Tensor
-    ) -> Dict[str, float]:
-        """Update value function using TD learning with enhanced stability"""
-        t = torch.zeros(states.shape[0], device=states.device)
-        
-        # Current values
-        current_values = self.value_network(states, t).squeeze(-1)
-        
-        # Target values with enhanced stability
-        with torch.no_grad():
-            next_values = self.value_network(next_states, t).squeeze(-1)
-            target_values = rewards + self.config.discount_factor * (1 - dones.long()) * next_values
-            
-            # Clip extreme values for stability
-            target_values = torch.clamp(target_values, -100, 100)
-            
-        # Huber loss for enhanced robustness
-        value_loss = F.huber_loss(current_values, target_values, delta=10.0)
-        
-        # Enhanced monitoring
-        td_error = (current_values - target_values).abs().mean()
-        
-        return {
-            'value_loss': value_loss.item(),
-            'mean_value': current_values.mean().item(),
-            'mean_target': target_values.mean().item(),
-            'td_error': td_error.item()
-        }
+        values: torch.Tensor,
+        next_values: torch.Tensor,
+        dones: torch.Tensor,
+        lambda_: float = 0.95,
+        n_steps: int = 5
+    ) -> torch.Tensor:
+        """
+        Compute λ-returns as in Dreamer v2.
     
-    def get_training_metrics(self) -> Dict[str, float]:
-        """Comprehensive training diagnostics"""
-        metrics = {}
+        The λ-return is a weighted average of n-step returns:
+        G^λ_t = (1-λ) Σ_{n=1}^{N-1} λ^{n-1} G^n_t + λ^{N-1} G^N_t
+    
+        Where G^n_t is the n-step return.
+        """
+        batch_size = rewards.shape[0]
+        device = rewards.device
+    
+        # Initialize returns storage
+        lambda_returns = torch.zeros_like(rewards)
+    
+        # Compute n-step returns
+        for idx in range(batch_size):
+            returns = []
         
-        # Belief dynamics health
-        belief_mean, belief_cov = self.belief_dynamics.get_parameters()
-        metrics['belief_mean_norm'] = belief_mean.norm().item()
-        
-        if self.config.belief_dynamics.use_full_covariance:
-            metrics['belief_cov_det'] = torch.det(belief_cov).item()
-            metrics['belief_cov_trace'] = torch.trace(belief_cov).item()
-        else:
-            metrics['belief_var_mean'] = belief_cov.diag().mean().item()
+            # Calculate different n-step returns
+            for n in range(1, min(n_steps + 1, batch_size - idx)):
+                n_step_return = 0
+                discount = 1.0
             
-        # Score network health
-        score_params = list(self.score_network.parameters())
-        metrics['score_grad_norm'] = sum(p.grad.norm().item() 
-                                       for p in score_params if p.grad is not None)
+                # Sum discounted rewards for n steps
+                for k in range(n):
+                    if idx + k < batch_size:
+                        n_step_return += discount * rewards[idx + k]
+                        discount *= self.config.discount_factor * (1 - dones[idx + k].float())
+                    
+                # Add bootstrapped value
+                if idx + n < batch_size and not dones[idx + n - 1]:
+                    n_step_return += discount * next_values[idx + n]
+                
+                returns.append(n_step_return)
         
-        return metrics
+            # Compute weighted average with λ
+            if returns:
+                weighted_return = 0
+                lambda_sum = 0
+            
+                for i, ret in enumerate(returns[:-1]):
+                    weight = (1 - lambda_) * (lambda_ ** i)
+                    weighted_return += weight * ret
+                    lambda_sum += weight
+                
+                # Last return gets remaining weight
+                if len(returns) > 0:
+                    last_weight = lambda_ ** (len(returns) - 1)
+                    weighted_return += last_weight * returns[-1]
+                    lambda_sum += last_weight
+                
+                lambda_returns[idx] = weighted_return / (lambda_sum + 1e-8)
+            else:
+                lambda_returns[idx] = rewards[idx] + self.config.discount_factor * (1 - dones[idx].float()) * next_values[idx]
+    
+        return lambda_returns  
+      
+def extract(a: torch.Tensor, t: torch.Tensor, x_shape: Tuple) -> torch.Tensor:
+    """Extract coefficients helper"""
+    batch_size = t.shape[0]
+    out = a.gather(-1, t)
+    return out.reshape(batch_size, *((1,) * (len(x_shape) - 1)))
     
 

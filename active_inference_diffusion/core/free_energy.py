@@ -74,7 +74,7 @@ class FreeEnergyComputation(nn.Module):
         
         # Score matching regularization
         t = torch.full((batch_size,), current_time, device=device)
-        score = score_network(states, t, actions)
+        score = score_network(states, t, observations)
         score_reg = 0.01 * torch.sum(score ** 2, dim=-1).mean()
         
         # Total free energy

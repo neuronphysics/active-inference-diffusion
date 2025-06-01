@@ -1,117 +1,133 @@
-import os
-import sys
+"""
+Training script for Diffusion Active Inference on MuJoCo
+"""
+
 import torch
-import numpy as np
 import gymnasium as gym
-from tqdm import tqdm
-import wandb
+import numpy as np
 from pathlib import Path
 import argparse
-import yaml
-from typing import Dict, Optional
+from typing import Dict, Any
 
-# Add parent directory to path to import the package
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-# Import from our package
-from active_inference_diffusion.agents import StateBasedAgent
+from active_inference_diffusion.agents import DiffusionStateAgent, DiffusionPixelAgent
 from active_inference_diffusion.configs.config import (
-    ActiveInferenceConfig,
+    ActiveInferenceConfig, 
     TrainingConfig,
     DiffusionConfig,
-    BeliefDynamicsConfig
+    PixelObservationConfig
 )
 from active_inference_diffusion.utils.logger import Logger
 from active_inference_diffusion.utils.training import (
-    save_checkpoint, 
-    load_checkpoint, 
     evaluate_agent,
+    save_checkpoint,
     create_video,
     plot_training_curves
 )
+from active_inference_diffusion.envs.wrappers import NormalizeObservation, ActionRepeat
+from active_inference_diffusion.envs.pixel_wrappers import make_pixel_mujoco
 
 
-def load_config(config_path: str) -> Dict:
-    """Load and parse YAML config"""
-    with open(config_path, 'r') as f:
-        config_dict = yaml.safe_load(f)
-    
-    # Parse nested configs
-    ai_config_dict = config_dict.get('active_inference', {})
-    # Convert numeric fields to float
-    numeric_fields = [
-        'learning_rate', 'beta_start', 'beta_end', 
-        'diffusion_coefficient', 'precision_init'
-    ]
-    for field in numeric_fields:
-        if field in ai_config_dict:
-            ai_config_dict[field] = float(ai_config_dict[field])
-
-    # Create nested config objects
-    if 'diffusion' in ai_config_dict:
-        ai_config_dict['diffusion'] = DiffusionConfig(**ai_config_dict['diffusion'])
-    
-    if 'belief_dynamics' in ai_config_dict:
-        ai_config_dict['belief_dynamics'] = BeliefDynamicsConfig(**ai_config_dict['belief_dynamics'])
-    
-    # Create main configs
-    ai_config = ActiveInferenceConfig(**ai_config_dict)
-    train_config = TrainingConfig(**config_dict.get('training', {}))
-    
-    return ai_config, train_config
-
-
-def train_state_based(
-    env_name: str, 
-    config_path: Optional[str] = None, 
-    resume: bool = False,
+def setup_environment(
+    env_name: str,
+    use_pixels: bool = False,
     seed: int = 0
+) -> gym.Env:
+    """Setup MuJoCo environment with appropriate wrappers"""
+    
+    if use_pixels:
+        # Pixel-based environment
+        env = make_pixel_mujoco(
+            env_name,
+            width=84,
+            height=84,
+            frame_stack=3,
+            action_repeat=2,
+            seed=seed
+        )
+    else:
+        # State-based environment
+        env = gym.make(env_name)
+        env = NormalizeObservation(env)
+        env = ActionRepeat(env, repeat=2)
+        
+        # Set seeds
+        env.reset(seed=seed)
+        env.action_space.seed(seed)
+        env.observation_space.seed(seed)
+        
+    return env
+
+
+def train_diffusion_active_inference(
+    env_name: str = "HalfCheetah-v4",
+    use_pixels: bool = False,
+    total_timesteps: int = 1_000_000,
+    seed: int = 0,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
 ):
-    """Train state-based Active Inference agent"""
+    """Main training function"""
     
     # Set seeds
     torch.manual_seed(seed)
     np.random.seed(seed)
     
-    # Load or create config
-    if config_path:
-        ai_config, train_config = load_config(config_path)
-        # Override env name if specified
-        ai_config.env_name = env_name
-    else:
-        ai_config = ActiveInferenceConfig(env_name=env_name)
-        train_config = TrainingConfig()
+    # Create environment
+    env = setup_environment(env_name, use_pixels, seed)
+    eval_env = setup_environment(env_name, use_pixels, seed + 100)
     
-    # Create environments
-    env = gym.make(env_name)
-    eval_env = gym.make(env_name)
+    # Create configurations
+    config = ActiveInferenceConfig(
+        env_name=env_name,
+        latent_dim=50,
+        hidden_dim=256,
+        learning_rate=3e-4,
+        batch_size=256,
+        efe_horizon=5,
+        epistemic_weight=0.1,
+        pragmatic_weight=1.0,
+        consistency_weight=0.1,
+        kl_weight=0.1,
+        diffusion_weight=1.0,
+        device=device
+    )
     
-    # Set seeds for environments
-    env.reset(seed=seed)
-    eval_env.reset(seed=seed + 1000)
+    # Enhanced diffusion config
+    config.diffusion = DiffusionConfig(
+        num_diffusion_steps=50,  # Fewer steps for faster inference
+        beta_schedule="cosine",
+        beta_start=1e-4,
+        beta_end=0.02
+    )
+    
+    training_config = TrainingConfig(
+        total_timesteps=total_timesteps,
+        eval_frequency=10_000,
+        save_frequency=50_000,
+        log_frequency=1_000,
+        buffer_size=100_000,
+        learning_starts=10_000,
+        gradient_steps=2,
+        exploration_noise=0.1,
+        exploration_decay=0.999
+    )
     
     # Create agent
-    agent = StateBasedAgent(env, ai_config, train_config)
-    
-    # Resume from checkpoint if requested
-    start_step = 0
-    if resume:
-        try:
-            checkpoint = load_checkpoint(agent, "latest.pt")
-            start_step = agent.total_steps
-            print(f"Resuming training from step {start_step}")
-        except FileNotFoundError:
-            print("No checkpoint found, starting fresh")
-    
-    # Setup logging
+    if use_pixels:
+        pixel_config = PixelObservationConfig()
+        agent = DiffusionPixelAgent(
+            env, config, training_config, pixel_config
+        )
+    else:
+        agent = DiffusionStateAgent(env, config, training_config)
+        
+    # Create logger
     logger = Logger(
-        use_wandb=train_config.use_wandb,
-        project_name=train_config.project_name,
-        experiment_name=f"{env_name}_state_ai_seed{seed}",
+        use_wandb=True,
+        project_name="diffusion-active-inference-mujoco",
+        experiment_name=f"{env_name}_{'pixels' if use_pixels else 'states'}_seed{seed}",
         config={
-            **ai_config.__dict__, 
-            **train_config.__dict__,
-            'seed': seed
+            **config.__dict__,
+            **training_config.__dict__
         }
     )
     
@@ -119,19 +135,10 @@ def train_state_based(
     obs, _ = env.reset()
     episode_reward = 0
     episode_length = 0
-    best_eval_reward = -float('inf')
     
-    for step in tqdm(range(start_step, train_config.total_timesteps), desc="Training"):
-        # Act
+    for step in range(total_timesteps):
+        # Select action
         action, info = agent.act(obs, deterministic=False)
-        
-        # Log belief dynamics info periodically
-        if step % 100 == 0:
-            logger.log({
-                'belief/entropy': info.get('belief_entropy', 0),
-                'belief/expected_free_energy': info.get('expected_free_energy', 0),
-                'exploration/noise': agent.exploration_noise
-            }, step=step)
         
         # Step environment
         next_obs, reward, terminated, truncated, _ = env.step(action)
@@ -140,102 +147,100 @@ def train_state_based(
         # Store transition
         agent.replay_buffer.add(obs, action, reward, next_obs, done)
         
-        # Update state
-        obs = next_obs
+        # Update counters
         episode_reward += reward
         episode_length += 1
-        agent.total_steps = step
-        
-        # Reset if done
+        agent.total_steps += 1
+        train_metrics = {}
+        # Train
+        if step > training_config.learning_starts:
+            for _ in range(training_config.gradient_steps):
+                train_metrics = agent.train_step()
+                
+        # Episode end
         if done:
+            # Log episode metrics
             logger.log({
                 'episode/reward': episode_reward,
                 'episode/length': episode_length,
-                'episode/count': agent.episode_count
-            }, step=step)
+                'episode/count': agent.episode_count,
+                'exploration_noise': agent.exploration_noise,
+                **info
+            }, step)
             
+            # Reset
             obs, _ = env.reset()
             episode_reward = 0
             episode_length = 0
             agent.episode_count += 1
-        
-        # Train
-        if step >= train_config.learning_starts and step % train_config.train_frequency == 0:
-            for _ in range(train_config.gradient_steps):
-                train_metrics = agent.train_step()
             
-            if step % train_config.log_frequency == 0:
-                logger.log(train_metrics, step=step)
-        
-        # Update exploration
-        agent.update_exploration()
-        
-        # Evaluate
-        if step % train_config.eval_frequency == 0 and step > 0:
-            eval_metrics = evaluate_agent(agent, eval_env, train_config.num_eval_episodes)
-            logger.log(eval_metrics, step=step)
+            # Update exploration
+            agent.update_exploration()
+        else:
+            obs = next_obs
             
-            eval_reward = eval_metrics['eval/mean_reward']
-            print(f"Step {step}: Eval Reward = {eval_reward:.2f}")
+        # Evaluation
+        if step % training_config.eval_frequency == 0 and train_metrics:
+            eval_metrics = evaluate_agent(
+                agent, eval_env, 
+                num_episodes=training_config.num_eval_episodes
+            )
+            logger.log(eval_metrics, step)
             
-            # Save best model
-            if eval_reward > best_eval_reward:
-                best_eval_reward = eval_reward
-                save_checkpoint(agent, "best.pt")
-                print(f"New best model saved! Reward: {eval_reward:.2f}")
-        
         # Save checkpoint
-        if step % train_config.save_frequency == 0 and step > 0:
-            save_checkpoint(agent, f"checkpoint_{step}.pt")
-            save_checkpoint(agent, "latest.pt")  # Always keep latest
+        if step % training_config.save_frequency == 0:
+            save_checkpoint(
+                agent,
+                f"{env_name}_step{step}.pt",
+                additional_info={'step': step}
+            )
+            
+        # Log training metrics
+        if step % training_config.log_frequency == 0 and len(train_metrics) > 0:
+            logger.log(train_metrics, step)
+            
+    # Final evaluation and video
+    final_eval = evaluate_agent(agent, eval_env, num_episodes=20)
+    logger.log(final_eval, total_timesteps)
     
-    # Final evaluation
-    print("\nFinal evaluation...")
-    final_metrics = evaluate_agent(agent, eval_env, train_config.num_eval_episodes * 2)
-    logger.log(final_metrics, step=train_config.total_timesteps)
-    print(f"Final Eval Reward: {final_metrics['eval/mean_reward']:.2f}")
+    create_video(
+        agent, eval_env,
+        f"{env_name}_final.mp4",
+        num_episodes=3
+    )
     
-    # Create video with best model
-    try:
-        load_checkpoint(agent, "best.pt")
-        video_path = f"videos/{env_name}_best.mp4"
-        create_video(agent, eval_env, video_path, num_episodes=5)
-        print(f"Video saved to {video_path}")
-    except Exception as e:
-        print(f"Could not create video: {e}")
+    # Save final model
+    save_checkpoint(agent, f"{env_name}_final.pt")
     
-    # Plot training curves
-    try:
-        plot_training_curves(
-            logger.log_path,
-            f"plots/{env_name}_training_curves.png",
-            metrics=['episode/reward', 'free_energy', 'belief/entropy']
-        )
-    except Exception as e:
-        print(f"Could not create plots: {e}")
+    # Create plots
+    plot_training_curves(
+        logger.log_file,
+        save_path=f"plots/{env_name}_training.png",
+        metrics=['episode/reward', 'elbo', 'policy_loss', 'value_loss']
+    )
     
-    env.close()
-    eval_env.close()
     logger.finish()
+    
+    return agent
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--env', type=str, default='HalfCheetah-v4',
-                        help='Environment name')
-    parser.add_argument('--config', type=str, default=None,
-                        help='Path to config file')
-    parser.add_argument('--seed', type=int, default=0,
-                        help='Random seed')
-    parser.add_argument('--resume', action='store_true',
-                        help='Resume from latest checkpoint')
+                       choices=['HalfCheetah-v4', 'Hopper-v4', 'Walker2d-v4', 
+                               'Ant-v4', 'Humanoid-v4', 'HumanoidStandup-v4'])
+    parser.add_argument('--pixels', action='store_true', 
+                       help='Use pixel observations')
+    parser.add_argument('--timesteps', type=int, default=1_000_000)
+    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--device', type=str, default='cuda')
     
     args = parser.parse_args()
     
-    # Use default config if not specified
-    if args.config is None:
-        config_path = f"configs/halfcheetah_state.yaml"
-        if os.path.exists(config_path):
-            args.config = config_path
-    
-    train_state_based(args.env, args.config, resume=args.resume, seed=args.seed)
+    train_diffusion_active_inference(
+        env_name=args.env,
+        use_pixels=args.pixels,
+        total_timesteps=args.timesteps,
+        seed=args.seed,
+        device=args.device
+    )

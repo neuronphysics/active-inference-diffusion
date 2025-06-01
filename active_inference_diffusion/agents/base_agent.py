@@ -11,7 +11,7 @@ from typing import Dict, Tuple, Optional, Union, Any
 from abc import ABC, abstractmethod
 import gymnasium as gym
 
-from ..core.active_inference import ActiveInferenceCore
+from ..core.active_inference import DiffusionActiveInference
 from ..encoder.visual_encoders import RandomShiftAugmentation
 from ..encoder.state_encoders import StateEncoder, EncoderFactory
 from ..utils.buffers import ReplayBuffer
@@ -21,7 +21,36 @@ from ..configs.config import (
     TrainingConfig
 )
 
+class RunningMeanStd:
+    """Tracks running statistics for reward normalization"""
+    def __init__(self, epsilon=1e-4, shape=()):
+        self.mean = np.zeros(shape, dtype=np.float64)
+        self.var = np.ones(shape, dtype=np.float64)
+        self.count = epsilon
 
+    def update(self, x):
+        batch_mean = np.mean(x, axis=0)
+        batch_var = np.var(x, axis=0)
+        batch_count = x.shape[0]
+        self.update_from_moments(batch_mean, batch_var, batch_count)
+
+    def update_from_moments(self, batch_mean, batch_var, batch_count):
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+
+        new_mean = self.mean + delta * batch_count / tot_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + np.square(delta) * self.count * batch_count / tot_count
+        new_var = M2 / tot_count
+
+        self.mean = new_mean
+        self.var = new_var
+        self.count = tot_count
+
+    def normalize(self, x):
+        return (x - self.mean) / np.sqrt(self.var + 1e-8)
+    
 class BaseActiveInferenceAgent(ABC):
     """Base class for Active Inference agents"""
     
@@ -52,7 +81,7 @@ class BaseActiveInferenceAgent(ABC):
         self.total_steps = 0
         self.episode_count = 0
         self.exploration_noise = training_config.exploration_noise
-        
+        self.reward_normalizer = RunningMeanStd(shape=())
     @abstractmethod
     def _setup_dimensions(self):
         """Setup state/action dimensions"""
@@ -139,90 +168,8 @@ class BaseActiveInferenceAgent(ABC):
         
     def train_step(self) -> Dict[str, float]:
         """Single training step"""
-        if len(self.replay_buffer) < self.config.batch_size:
-            return {}
-            
-        # Sample batch
-        batch = self.replay_buffer.sample(self.config.batch_size)
-        
-        # Process batch
-        states = self._process_batch_observations(batch['observations'])
-        states =self.active_inference.encoder(states).to(self.device)
-        actions = batch['actions'].to(self.device)
-        rewards = batch['rewards'].to(self.device)
-        next_states = self._process_batch_observations(batch['next_observations'])
-        next_states = self.active_inference.encoder(next_states).to(self.device) 
-        dones = batch['dones'].to(self.device)
-        
-        metrics = {}
-        
-        # 1. Train dynamics model
-        self.dynamics_optimizer.zero_grad()
-        dynamics_metrics = self.active_inference.train_dynamics(
-            states, actions, next_states, rewards
-        )
-        dynamics_loss = dynamics_metrics['total_loss']
-        dynamics_loss_tensor = torch.tensor(dynamics_loss, requires_grad=True)
-        dynamics_loss_tensor.backward()
-        nn.utils.clip_grad_norm_(
-            list(self.active_inference.dynamics_model.parameters()) +
-            list(self.active_inference.reward_predictor.parameters()),
-            self.config.gradient_clip
-        )
-        self.dynamics_optimizer.step()
-        metrics.update(dynamics_metrics)
-        
-        # 2. Train value function
-        self.value_optimizer.zero_grad()
-        value_metrics = self.active_inference.update_value_function(
-            states, rewards, next_states, dones
-        )
-        value_loss = torch.tensor(value_metrics['value_loss'], requires_grad=True)
-        value_loss.backward()
-        nn.utils.clip_grad_norm_(
-            self.active_inference.value_network.parameters(),
-            self.config.gradient_clip
-        )
-        self.value_optimizer.step()
-        metrics.update(value_metrics)
-        
-        # 3. Train score network (free energy)
-        self.score_optimizer.zero_grad()
-        free_energy, fe_info = self.active_inference.compute_free_energy_loss(
-            states, states, actions  # Using states as observations
-        )
-        free_energy.backward()
-        nn.utils.clip_grad_norm_(
-            self.active_inference.score_network.parameters(),
-            self.config.gradient_clip
-        )
-        self.score_optimizer.step()
-        metrics['free_energy'] = free_energy.item()
-        metrics['complexity'] = fe_info['complexity'].item()
-        metrics['accuracy'] = fe_info['accuracy'].item()
-        
-        # 4. Train policy (minimize expected free energy)
-        self.policy_optimizer.zero_grad()
-        efe, efe_info = self.active_inference.compute_expected_free_energy(states)
-        policy_loss = efe.mean()
-        policy_loss.backward()
-        nn.utils.clip_grad_norm_(
-            self.active_inference.policy_network.parameters(),
-            self.config.gradient_clip
-        )
-        self.policy_optimizer.step()
-        metrics['expected_free_energy'] = efe.mean().item()
-        metrics['policy_loss'] = policy_loss.item()
-        
-        # Update precision
-        self.active_inference.free_energy.update_precision(
-            fe_info['complexity'],
-            fe_info['accuracy']
-        )
-        metrics['precision'] = self.active_inference.free_energy.precision.item()
-        
-        return metrics
-        
+        pass
+
     @abstractmethod
     def _process_batch_observations(self, observations: torch.Tensor) -> torch.Tensor:
         """Process batch of observations"""

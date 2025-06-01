@@ -3,13 +3,11 @@ Agent implementations
 """
 
 from .base_agent import BaseActiveInferenceAgent
-from .state_agent import StateBasedAgent, StateActiveInference
-from .pixel_agent import PixelBasedAgent, PixelActiveInference
+from .state_agent import DiffusionStateAgent
+from .pixel_agent import DiffusionPixelAgent  # After renaming
 
 __all__ = [
     "BaseActiveInferenceAgent",
-    "StateBasedAgent",
-    "StateActiveInference",
-    "PixelBasedAgent",
-    "PixelActiveInference",
+    "DiffusionStateAgent",
+    "DiffusionPixelAgent",
 ]

@@ -1,165 +1,195 @@
 """
-Diffusion process implementation
+Diffusion Process for Latent Space Generation
+Implements the theoretical framework for diffusion-generated belief representations
 """
 
 import torch
 import torch.nn as nn
-from typing import Tuple, Optional
-import numpy as np
 import torch.nn.functional as F
+from typing import Tuple, Optional, Dict, List
+import numpy as np
+import math
 
-class DiffusionProcess(nn.Module):
+
+class LatentDiffusionProcess(nn.Module):
     """
-    Implements diffusion process for generative modeling
-    Supports various noise schedules and parameterizations
+    Implements diffusion process specifically for latent space generation
+    in active inference framework.
+    
+    Key innovations:
+    - Generates latent belief representations from noise
+    - Conditions on observations for context-aware generation
+    - Integrates with policy conditioning mechanisms
     """
     
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.latent_dim = config.latent_dim
         
-        # Setup noise schedule
+        # Initialize noise schedule
         self.setup_schedule()
         
-    def setup_schedule(self):
-        """Initialize noise schedule β_t"""
-        steps = self.config.num_diffusion_steps
-        beta_start = float(self.config.beta_start)
-        beta_end = float(self.config.beta_end)
+        # Learnable initial distribution parameters
+        self.register_parameter('latent_prior_mean', 
+                              nn.Parameter(torch.zeros(self.latent_dim)))
+        self.register_parameter('latent_prior_log_std', 
+                              nn.Parameter(torch.zeros(self.latent_dim)))
         
-        if self.config.beta_schedule == "linear":
-            betas = torch.linspace(
-                beta_start,
-                beta_end,
-                steps
-            )
-        elif self.config.beta_schedule == "cosine":
-            # Cosine schedule from Nichol & Dhariwal 2021
+    def setup_schedule(self):
+        """Enhanced schedule for latent diffusion"""
+        steps = self.config.num_diffusion_steps
+        
+        if self.config.beta_schedule == "cosine":
+            # Cosine schedule optimized for latent spaces
             s = 0.008
             x = torch.linspace(0, steps, steps + 1)
             alphas_cumprod = torch.cos(((x / steps) + s) / (1 + s) * np.pi * 0.5) ** 2
             alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
             betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-            betas = torch.clamp(betas, min=0.0001, max=0.999)
-        elif self.config.beta_schedule == "sigmoid":
-            betas = torch.sigmoid(torch.linspace(-6, 6, steps))
-            betas = betas * (self.config.beta_end - self.config.beta_start) + self.config.beta_start
+            betas = torch.clamp(betas, min=1e-4, max=0.999)
+        elif self.config.beta_schedule == "linear":
+            betas = torch.linspace(
+                self.config.beta_start,
+                self.config.beta_end,
+                steps
+            )
         else:
-            raise ValueError(f"Unknown beta schedule: {self.config.beta_schedule}")
+            raise ValueError(f"Unknown schedule: {self.config.beta_schedule}")
             
         alphas = 1.0 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
         alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.0)
         
-        # Calculations for diffusion q(x_t | x_{t-1})
+        # Register all necessary buffers
         self.register_buffer('betas', betas)
         self.register_buffer('alphas', alphas)
         self.register_buffer('alphas_cumprod', alphas_cumprod)
         self.register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
-        
-        # Calculations for posterior q(x_{t-1} | x_t, x_0)
         self.register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
-        self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1.0 - alphas_cumprod))
-        self.register_buffer('log_one_minus_alphas_cumprod', torch.log(1.0 - alphas_cumprod))
-        self.register_buffer('sqrt_recip_alphas_cumprod', torch.sqrt(1.0 / alphas_cumprod))
-        self.register_buffer('sqrt_recipm1_alphas_cumprod', torch.sqrt(1.0 / alphas_cumprod - 1))
+        self.register_buffer('sqrt_one_minus_alphas_cumprod', 
+                           torch.sqrt(1.0 - alphas_cumprod))
         
-        # Posterior variance
+        # Posterior parameters
         posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
         self.register_buffer('posterior_variance', posterior_variance)
         self.register_buffer('posterior_log_variance_clipped',
                            torch.log(torch.clamp(posterior_variance, min=1e-20)))
-        self.register_buffer('posterior_mean_coef1',
-                           betas * torch.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod))
-        self.register_buffer('posterior_mean_coef2',
-                           (1.0 - alphas_cumprod_prev) * torch.sqrt(alphas) / (1.0 - alphas_cumprod))
+        
+    def sample_latent_prior(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """Sample from learned latent prior p_θ(z)"""
+        mean = self.latent_prior_mean.unsqueeze(0).expand(batch_size, -1)
+        std = torch.exp(self.latent_prior_log_std).unsqueeze(0).expand(batch_size, -1)
+        
+        eps = torch.randn_like(mean)
+        return mean + std * eps
         
     def q_sample(
         self,
-        x_start: torch.Tensor,
+        z_start: torch.Tensor,
         t: torch.Tensor,
         noise: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward diffusion process: q(x_t | x_0)
-        x_t = √(ᾱ_t) * x_0 + √(1 - ᾱ_t) * ε
+        Forward diffusion for latent representations
+        Returns both noisy latent and the noise used
         """
         if noise is None:
-            noise = torch.randn_like(x_start)
+            noise = torch.randn_like(z_start)
             
-        sqrt_alphas_cumprod_t = extract(self.sqrt_alphas_cumprod, t, x_start.shape)
-        sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
-        
-        return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
-        
-    def predict_start_from_score(
-        self,
-        x_t: torch.Tensor,
-        t: torch.Tensor,
-        score: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Predict x_0 from score function
-        x_0 = (x_t + (1 - ᾱ_t) * score) / √(ᾱ_t)
-        """
-        sqrt_recip_alphas_cumprod_t = extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape)
-        sqrt_recipm1_alphas_cumprod_t = extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
-        
-        return sqrt_recip_alphas_cumprod_t * x_t + sqrt_recipm1_alphas_cumprod_t * score
-        
-    def p_mean_variance(
-        self,
-        x_t: torch.Tensor,
-        t: torch.Tensor,
-        score: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Compute mean and variance of p(x_{t-1} | x_t) using score
-        """
-        # Predict x_0
-        pred_x_start = self.predict_start_from_score(x_t, t, score)
-        
-        # Clip predictions
-        pred_x_start = torch.clamp(pred_x_start, min=-1, max=1)
-        
-        # Compute posterior mean
-        posterior_mean = (
-            extract(self.posterior_mean_coef1, t, x_t.shape) * pred_x_start +
-            extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
+        sqrt_alphas_cumprod_t = extract(self.sqrt_alphas_cumprod, t, z_start.shape)
+        sqrt_one_minus_alphas_cumprod_t = extract(
+            self.sqrt_one_minus_alphas_cumprod, t, z_start.shape
         )
         
-        posterior_variance = extract(self.posterior_variance, t, x_t.shape)
-        posterior_log_variance = extract(self.posterior_log_variance_clipped, t, x_t.shape)
+        z_noisy = sqrt_alphas_cumprod_t * z_start + sqrt_one_minus_alphas_cumprod_t * noise
         
-        return posterior_mean, posterior_variance, posterior_log_variance
+        return z_noisy, noise
+        
+    def generate_latent_trajectory(
+        self,
+        score_network: nn.Module,
+        batch_size: int,
+        observation: Optional[torch.Tensor] = None,
+        deterministic: bool = False
+    ) -> List[torch.Tensor]:
+        """
+        Generate latent trajectory via reverse diffusion
+        This is the core innovation - generating belief representations
+        """
+        device = next(score_network.parameters()).device
+        # Ensure observation is on correct device
+        if observation is not None:
+            observation = observation.to(device)
+    
+        z = torch.randn(batch_size, self.latent_dim, device=device)  # Fix shape tuple
+        trajectory = [z]
+        
+        # Reverse diffusion process
+        for t in reversed(range(self.config.num_diffusion_steps)):
+            t_batch = torch.full((batch_size,), t, device=device, dtype=torch.long)
+            
+            # Predict score conditioned on observation
+            score = score_network(z, t_batch.float(), observation)
+            
+            # Update latent
+            z = self.p_sample(z, t_batch, score, deterministic=deterministic)
+            trajectory.append(z)
+            
+        return trajectory
         
     def p_sample(
         self,
-        x_t: torch.Tensor,
+        z_t: torch.Tensor,
         t: torch.Tensor,
         score: torch.Tensor,
-        clip_denoised: bool = True
+        deterministic: bool = False
     ) -> torch.Tensor:
         """
-        Sample from p(x_{t-1} | x_t) using score
+        Reverse diffusion step for latent generation
+        Implements the score-based update rule
         """
-        mean, _, log_variance = self.p_mean_variance(x_t, t, score)
+        # Extract parameters
+        beta_t = extract(self.betas, t, z_t.shape)
+        sqrt_one_minus_alphas_cumprod_t = extract(
+            self.sqrt_one_minus_alphas_cumprod, t, z_t.shape
+        )
+        sqrt_recip_alphas_t = extract(1.0 / torch.sqrt(self.alphas), t, z_t.shape)
         
-        noise = torch.randn_like(x_t)
-        # No noise when t == 0
-        nonzero_mask = ((t != 0).float().view(-1, *([1] * (len(x_t.shape) - 1))))
+        # Predict z_0
+        predicted_z_start = (z_t + sqrt_one_minus_alphas_cumprod_t * score) * sqrt_recip_alphas_t
         
-        return mean + nonzero_mask * torch.exp(0.5 * log_variance) * noise
+        # Compute posterior mean
+        posterior_mean = self._posterior_mean(predicted_z_start, z_t, t)
+        
+        if deterministic or t[0] == 0:
+            return posterior_mean
+        else:
+            posterior_variance = extract(self.posterior_variance, t, z_t.shape)
+            noise = torch.randn_like(z_t)
+            return posterior_mean + torch.sqrt(posterior_variance) * noise
+            
+    def _posterior_mean(
+        self,
+        z_start: torch.Tensor,
+        z_t: torch.Tensor,
+        t: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute posterior mean for reverse process"""
+        posterior_mean_coef1 = extract(
+            self.betas * torch.sqrt(self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod),
+            t, z_start.shape
+        )
+        posterior_mean_coef2 = extract(
+            (1.0 - self.alphas_cumprod_prev) * torch.sqrt(self.alphas) / (1.0 - self.alphas_cumprod),
+            t, z_t.shape
+        )
+        
+        return posterior_mean_coef1 * z_start + posterior_mean_coef2 * z_t
 
 
 def extract(a: torch.Tensor, t: torch.Tensor, x_shape: Tuple) -> torch.Tensor:
-    """Extract coefficients at timestep t and reshape to broadcast"""
+    """Extract coefficients at timestep t"""
     batch_size = t.shape[0]
-    t_indices = t.long()
-    if t_indices.device != a.device:
-        t_indices = t_indices.to(a.device)
-
-    out = a.gather(-1, t_indices)
-    broadcast_shape = [batch_size] + [1] * (len(x_shape) - 1)
-    return out.reshape(*broadcast_shape).to(t.device)
-
+    out = a.gather(-1, t)
+    return out.reshape(batch_size, *((1,) * (len(x_shape) - 1)))

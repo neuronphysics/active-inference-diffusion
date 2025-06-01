@@ -4,10 +4,10 @@ Configuration classes
 
 from .config import (
     DiffusionConfig,
+    TrainingConfig,
     BeliefDynamicsConfig,
     ActiveInferenceConfig,
     PixelObservationConfig,
-    TrainingConfig
 )
 
 __all__ = [

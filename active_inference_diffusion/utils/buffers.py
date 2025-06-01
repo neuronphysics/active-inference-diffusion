@@ -7,7 +7,7 @@ import torch
 import numpy as np
 from typing import Dict, Tuple, Optional
 import lz4.frame
-
+import pickle
 
 class ReplayBuffer:
     """
@@ -25,6 +25,7 @@ class ReplayBuffer:
         self.capacity = capacity
         self.device = device
         self.optimize_memory = optimize_memory
+        self.obs_shape = obs_shape
         self.pos = 0
         self.size = 0
         
@@ -73,14 +74,15 @@ class ReplayBuffer:
         
         if self.compress:
             # Decompress observations
-            obs = torch.stack([
-                torch.from_numpy(self._decompress(self.observations[i]))
-                for i in indices
-            ])
-            next_obs = torch.stack([
-                torch.from_numpy(self._decompress(self.next_observations[i]))
-                for i in indices
-            ])
+            obs_list = []
+            next_obs_list = []
+            
+            for i in indices:
+                obs_list.append(self._decompress_with_shape(self.observations[i]))
+                next_obs_list.append(self._decompress_with_shape(self.next_observations[i]))
+                
+            obs = torch.stack([torch.from_numpy(o).float() for o in obs_list])
+            next_obs = torch.stack([torch.from_numpy(o).float() for o in next_obs_list])
         else:
             obs = self.observations[indices]
             next_obs = self.next_observations[indices]
@@ -90,18 +92,35 @@ class ReplayBuffer:
             'actions': self.actions[indices],
             'rewards': self.rewards[indices],
             'next_observations': next_obs,
-            'dones': self.dones[indices]
+            'dones': self.dones[indices]  # Already float
         }
         
     def _compress(self, data: np.ndarray) -> bytes:
         """Compress numpy array"""
-        return lz4.frame.compress(data.tobytes())
+        meta = {
+            'shape': data.shape,
+            'dtype': str(data.dtype)
+        }
+        # Convert to bytes if needed
+        if data.dtype == np.uint8:
+            data_bytes = data.tobytes()
+        else:
+            data_bytes = data.astype(np.float32).tobytes()
+            
+        # Pickle metadata and compress everything
+        return lz4.frame.compress(pickle.dumps((meta, data_bytes)))
         
-    def _decompress(self, data: bytes) -> np.ndarray:
+    def _decompress(self, compressed_data: bytes) -> np.ndarray:
         """Decompress to numpy array"""
-        decompressed = lz4.frame.decompress(data)
-        # Infer shape from data size
-        return np.frombuffer(decompressed, dtype=np.uint8).reshape(-1)
+        meta, data_bytes = pickle.loads(lz4.frame.decompress(compressed_data))
+        
+        # Reconstruct array with correct shape and dtype
+        if meta['dtype'] == 'uint8':
+            array = np.frombuffer(data_bytes, dtype=np.uint8).reshape(meta['shape'])
+        else:
+            array = np.frombuffer(data_bytes, dtype=np.float32).reshape(meta['shape'])
+            
+        return array
         
     def __len__(self):
         return self.size
