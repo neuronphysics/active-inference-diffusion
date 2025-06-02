@@ -13,9 +13,9 @@ class DiffusionConfig:
     num_diffusion_steps: int = 1000
     beta_start: float = 1e-4
     beta_end: float = 0.02
-    beta_schedule: str = "linear"
+    beta_schedule: str = "cosine"  # Options: "cosine", "linear"
     prediction_type: str = "score"
-    latent_dim: int = 50  
+
     
 @dataclass
 class BeliefDynamicsConfig:
@@ -53,10 +53,10 @@ class ActiveInferenceConfig:
     diffusion_weight: float = 1.0  # score matching weight
     reward_weight:float = 0.5  # reward scaling
     # Model architecture
-    hidden_dim: int = 256
-    latent_dim: int = 50
+    hidden_dim: int = 512
+    latent_dim: int = 128
     num_layers: int = 3
-    
+    pixel_observation: bool = False  # Use pixel observations
     # Training
     batch_size: int = 256
     learning_rate: float = 3e-4

@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import numpy as np
 from typing import Dict, Tuple, Optional, List
 from ..configs import ActiveInferenceConfig
-
+from ..encoder.visual_encoders import ConvDecoder
 class DiffusionActiveInference(nn.Module):
     """
     Core Active Inference implementation with diffusion-generated latents
@@ -45,7 +45,7 @@ class DiffusionActiveInference(nn.Module):
         
         # Latent diffusion process
         from .diffusion import LatentDiffusionProcess
-        self.latent_diffusion = LatentDiffusionProcess(self.config.diffusion)
+        self.latent_diffusion = LatentDiffusionProcess(self.config.diffusion, latent_dim=self.latent_dim)
         
         # Score network for latent generation
         from ..models.score_networks import LatentScoreNetwork
@@ -84,24 +84,32 @@ class DiffusionActiveInference(nn.Module):
         )
         
         # Observation decoder (latent -> observation prediction)
-        self.observation_decoder = nn.ModuleList([
-            nn.Sequential(
-            nn.Linear(self.latent_dim, self.config.hidden_dim * 2),
-            nn.LayerNorm(self.config.hidden_dim * 2),
-            nn.SiLU(),
-        ),
-            nn.Sequential(
-            nn.Linear(self.config.hidden_dim * 2, self.config.hidden_dim * 2),
-            nn.LayerNorm(self.config.hidden_dim * 2),
-            nn.SiLU(),
-        ),
-            nn.Sequential(
-            nn.Linear(self.config.hidden_dim * 2, self.config.hidden_dim),
-            nn.LayerNorm(self.config.hidden_dim),
-            nn.SiLU(),
-        ),
-        nn.Linear(self.config.hidden_dim, self.observation_dim)
-        ])
+        if not self.config.pixel_observation:
+           self.observation_decoder = nn.ModuleList([
+                nn.Sequential(
+                nn.Linear(self.latent_dim, self.config.hidden_dim * 2),
+                nn.LayerNorm(self.config.hidden_dim * 2),
+                nn.SiLU(),
+                ),
+                nn.Sequential(
+                nn.Linear(self.config.hidden_dim * 2, self.config.hidden_dim * 2),
+                nn.LayerNorm(self.config.hidden_dim * 2),
+                nn.SiLU(),
+               ),
+                nn.Sequential(
+                nn.Linear(self.config.hidden_dim * 2, self.config.hidden_dim),
+                nn.LayerNorm(self.config.hidden_dim),
+                nn.SiLU(),
+               ),
+               nn.Linear(self.config.hidden_dim, self.observation_dim)
+               ])
+        else:
+            self.observation_decoder = ConvDecoder(
+                latent_dim=self.latent_dim,
+                output_dim=self.observation_dim,
+                hidden_dim=self.config.hidden_dim,
+                num_conv_layers=3
+                )
         #initialize a reward predictor
         self.reward_predictor = nn.Sequential(
             nn.Linear(self.latent_dim, self.config.hidden_dim),
@@ -114,20 +122,20 @@ class DiffusionActiveInference(nn.Module):
 
     def decode_observation(self, latent: torch.Tensor) -> torch.Tensor:
         """Enhanced decoding with residual connections"""
-        h = latent
-    
-        # First layer
-        h1 = self.observation_decoder[0](h)
-    
-        # Second layer with skip
-        h2 = self.observation_decoder[1](h1)
-        h2 = h2 + h1  # Skip connection
-    
-        # Third layer
-        h3 = self.observation_decoder[2](h2)
-    
-        # Output layer
-        return self.observation_decoder[3](h3)
+        if self.config.pixel_observation:
+            # For pixel observations, use convolutional decoder
+            return self.observation_decoder(latent)
+        else: #For non-pixel observations, use fully connected decoder
+            h = latent
+            # First layer
+            h1 = self.observation_decoder[0](h)
+            # Second layer with skip
+            h2 = self.observation_decoder[1](h1)
+            h2 = h2 + h1  # Skip connection
+            # Third layer
+            h3 = self.observation_decoder[2](h2)
+            # Output layer
+            return self.observation_decoder[3](h3)
         
     def update_belief_via_diffusion(
         self,
@@ -255,13 +263,15 @@ class DiffusionActiveInference(nn.Module):
         
     def _compute_latent_kl(
         self,
-        latent1: torch.Tensor,
-        latent2: torch.Tensor
-    ) -> torch.Tensor:
+        latent: torch.Tensor,
+        prior_latent: torch.Tensor
+        ) -> torch.Tensor:
         """KL divergence between latent distributions"""
         # Assume Gaussian with unit variance for simplicity
+        latents_norm = latent / (latent.norm(dim=-1, keepdim=True) + 1e-8)
+        prior_norm = prior_latent / (prior_latent.norm(dim=-1, keepdim=True) + 1e-8)
         # Can be extended to learned variances
-        kl = 0.5 * torch.sum((latent1 - latent2) ** 2, dim=-1)
+        kl = 0.5 * torch.sum((latents_norm - prior_norm) ** 2, dim=-1)
         return kl
         
     def act(
@@ -320,9 +330,10 @@ class DiffusionActiveInference(nn.Module):
             # Use current belief generation
             belief_info = self.update_belief_via_diffusion(observations)
             latents = belief_info['latent']
-            
+
+        latents = latents / (latents.norm(dim=-1, keepdim=True) + 1e-8)            
         # Reconstruction term
-        predicted_obs = self.observation_decoder(latents)
+        predicted_obs = self.decode_observation(latents)
         reconstruction_loss = F.mse_loss(predicted_obs, observations)
         
         # KL term against diffusion prior
@@ -332,7 +343,9 @@ class DiffusionActiveInference(nn.Module):
         # Diffusion score matching loss
         t = torch.randint(0, self.config.diffusion.num_diffusion_steps,
                          (batch_size,), device=device)
+        
         noise = torch.randn_like(latents)
+        noise = noise / (noise.norm(dim=-1, keepdim=True) + 1e-8)  # Normalize noise
         noisy_latents, _ = self.latent_diffusion.q_sample(latents, t, noise)
         
         predicted_score = self.latent_score_network(

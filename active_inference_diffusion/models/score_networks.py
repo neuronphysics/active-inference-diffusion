@@ -30,54 +30,56 @@ class LatentScoreNetwork(nn.Module):
         
         self.latent_dim = latent_dim
         self.observation_dim = observation_dim
-        self.use_attention = use_attention
         
-        # Time embedding with learnable frequency
+        # DiT configuration
+        self.num_heads = 8
+        self.mlp_ratio = 4.0
+        self.use_attention = use_attention
+        # Time embedding - FIXED to output hidden_dim
         self.time_embed = nn.Sequential(
             SinusoidalPositionEmbeddings(time_embed_dim),
-            nn.Linear(time_embed_dim, time_embed_dim * 2),
+            nn.Linear(time_embed_dim, hidden_dim*2),  # Changed to output hidden_dim directly
             nn.SiLU(),
-            nn.Linear(time_embed_dim * 2, time_embed_dim)
+            nn.Linear(hidden_dim*2, hidden_dim)
         )
         
-        # Observation encoder
+        # Observation encoder (unchanged)
         self.obs_encoder = nn.Sequential(
             nn.Linear(observation_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.SiLU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim)
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
         )
         
-        # Main score network with residual connections
-        self.score_blocks = nn.ModuleList()
-        
-        for i in range(num_layers):
-            if i == 0:
-                input_dim = latent_dim + time_embed_dim + hidden_dim
-            else:
-                input_dim = hidden_dim
-                
-            self.score_blocks.append(
-                ScoreResidualBlock(
-                    input_dim=input_dim,
+        # Input projection for latent
+        self.latent_proj = nn.Linear(latent_dim, hidden_dim)
+        if use_attention:
+            # DiT Transformer blocks
+            self.transformer_blocks = nn.ModuleList([
+                DiTBlock(
                     hidden_dim=hidden_dim,
-                    use_attention=use_attention and i % 2 == 0
+                    num_heads=self.num_heads,
+                    mlp_ratio=self.mlp_ratio,
+
                 )
-            )
+                for _ in range(num_layers)
+            ])
         
-        # Output projection
+        # Output projection with adaptive layer norm
+        self.norm_final = AdaptiveLayerNorm(hidden_dim)
         self.output_proj = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.SiLU(),
-            nn.Linear(hidden_dim // 2, latent_dim)
+            nn.Linear(hidden_dim // 2, latent_dim, bias=False)
         )
         
         # Initialize output to zero for stability
         nn.init.zeros_(self.output_proj[-1].weight)
-        nn.init.zeros_(self.output_proj[-1].bias)
         
     def forward(
         self,
@@ -98,96 +100,132 @@ class LatentScoreNetwork(nn.Module):
         """
         # Embed time
         t_emb = self.time_embed(time)
-        
+        batch_size = z_t.shape[0]
         # Encode observation
         if observation is not None:
             obs_emb = self.obs_encoder(observation)
         else:
             # Use learned null embedding
-            obs_emb = torch.zeros(z_t.shape[0], self.obs_encoder[-1].out_features, 
+            obs_emb = torch.zeros(batch_size, self.obs_encoder[-1].out_features, 
                                 device=z_t.device)
         
-        # Concatenate inputs
-        h = torch.cat([z_t, t_emb, obs_emb], dim=-1)
+        # Combine conditioning (time + observation)
+        # This will be used for adaptive normalization in DiT blocks
+        conditioning = t_emb + obs_emb  # [B, hidden_dim]
         
-        # Process through residual blocks
-        for block in self.score_blocks:
-            h = block(h, t_emb)
+        # Project latent to hidden dimension
+        h = self.latent_proj(z_t)  # [B, hidden_dim]
+
+        if self.use_attention:
+            # Process through DiT blocks
+            for block in self.transformer_blocks:
+                h = block(h, conditioning)
         
-        # Output score
+        # Final norm and output
+        h = self.norm_final(h, conditioning)
         score = self.output_proj(h)
         
         return score
 
-class ScoreResidualBlock(nn.Module):
-    """Residual block with optional attention for score network"""
+
+class DiTBlock(nn.Module):
+    """
+    Diffusion Transformer block with adaptive layer norm
+    """
     
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int,
-        use_attention: bool = False,
-        time_embed_dim: int = 128  # Add this parameter
-    ):
+    def __init__(self, hidden_dim: int, num_heads: int, mlp_ratio: float = 4.0):
         super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
         
-        self.use_attention = use_attention
+        # Adaptive layer norms (modulated by conditioning)
+        self.norm1 = AdaptiveLayerNorm(hidden_dim)
+        self.norm2 = AdaptiveLayerNorm(hidden_dim)
         
-        # First path
-        self.norm1 = nn.LayerNorm(hidden_dim if input_dim == hidden_dim else input_dim)
-        self.linear1 = nn.Linear(input_dim, hidden_dim)
-        self.act1 = nn.SiLU()
-        
-        # Time embedding projection
-        # This is the key fix - project time embedding to match hidden dimension
-        self.time_proj = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(time_embed_dim, hidden_dim)
+        # Self-attention
+        self.attention = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            batch_first=True,
+            dropout=0.0
         )
         
-        # Second path
-        self.norm2 = nn.LayerNorm(hidden_dim)
-        self.linear2 = nn.Linear(hidden_dim, hidden_dim)
-        self.act2 = nn.SiLU()
+        # MLP
+        mlp_hidden_dim = int(hidden_dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, mlp_hidden_dim),
+            nn.GELU(),
+            nn.Linear(mlp_hidden_dim, hidden_dim)
+        )
         
-        # Optional attention
-        if use_attention:
-            self.attention = nn.MultiheadAttention(
-                embed_dim=hidden_dim,
-                num_heads=4,
-                batch_first=True
-            )
-            self.norm_attn = nn.LayerNorm(hidden_dim)
+        # Initialize weights for better training stability
+        self._init_weights()
         
-        # Residual projection if dimensions don't match
-        self.residual_proj = nn.Linear(input_dim, hidden_dim) if input_dim != hidden_dim else nn.Identity()
+    def _init_weights(self):
+        # Initialize MLP
+        nn.init.xavier_uniform_(self.mlp[0].weight)
+        nn.init.xavier_uniform_(self.mlp[2].weight)
+        nn.init.zeros_(self.mlp[0].bias)
+        nn.init.zeros_(self.mlp[2].bias)
         
-    def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
-        """Forward pass with residual connection"""
-        residual = self.residual_proj(x)
+    def forward(self, x: torch.Tensor, conditioning: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass with conditioning
         
-        # First transformation
-        h = self.norm1(x)
-        h = self.linear1(h)
-        h = self.act1(h)
+        Args:
+            x: Input features [B, hidden_dim]
+            conditioning: Time + observation embedding [B, hidden_dim]
+        """
+        # Self-attention with adaptive norm
+        norm_x = self.norm1(x, conditioning)
+        # For single token (no sequence), we need to add sequence dimension
+        norm_x = norm_x.unsqueeze(1)  # [B, 1, hidden_dim]
+        attn_out, _ = self.attention(norm_x, norm_x, norm_x)
+        attn_out = attn_out.squeeze(1)  # [B, hidden_dim]
+        x = x + attn_out
         
-        # Time modulation with projection
-        # Project time embedding to match hidden dimension before adding
-        time_proj = self.time_proj(time_emb)
-        h = h + time_proj
+        # MLP with adaptive norm
+        norm_x = self.norm2(x, conditioning)
+        mlp_out = self.mlp(norm_x)
+        x = x + mlp_out
         
-        # Second transformation
-        h = self.norm2(h)
-        h = self.linear2(h)
-        h = self.act2(h)
+        return x
+
+
+class AdaptiveLayerNorm(nn.Module):
+    """
+    Adaptive Layer Normalization for conditioning in DiT
+    """
+    
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim, elementwise_affine=False)
         
-        # Optional attention
-        if self.use_attention:
-            h_attn = self.norm_attn(h)
-            h_attn, _ = self.attention(h_attn, h_attn, h_attn)
-            h = h + h_attn
+        # Projection for adaptive parameters
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 2 * hidden_dim)
+        )
         
-        return h + residual
+        # Initialize modulation to identity
+        nn.init.zeros_(self.adaLN_modulation[1].weight)
+        nn.init.zeros_(self.adaLN_modulation[1].bias)
+        
+    def forward(self, x: torch.Tensor, conditioning: torch.Tensor) -> torch.Tensor:
+        """
+        Apply adaptive layer norm
+        
+        Args:
+            x: Input features [B, hidden_dim]
+            conditioning: Conditioning features [B, hidden_dim]
+        """
+        # Get scale and shift from conditioning
+        scale_shift = self.adaLN_modulation(conditioning)
+        scale, shift = scale_shift.chunk(2, dim=-1)
+        
+        # Apply normalization with adaptive scale and shift
+        return self.norm(x) * (1 + scale) + shift
+
 
 class SinusoidalPositionEmbeddings(nn.Module):
     """Enhanced sinusoidal embeddings with learnable frequencies"""

@@ -22,10 +22,10 @@ class LatentDiffusionProcess(nn.Module):
     - Integrates with policy conditioning mechanisms
     """
     
-    def __init__(self, config):
+    def __init__(self, config, latent_dim: int = 64):
         super().__init__()
         self.config = config
-        self.latent_dim = config.latent_dim
+        self.latent_dim = latent_dim
         
         # Initialize noise schedule
         self.setup_schedule()
@@ -36,6 +36,9 @@ class LatentDiffusionProcess(nn.Module):
         self.register_parameter('latent_prior_log_std', 
                               nn.Parameter(torch.zeros(self.latent_dim)))
         
+        if getattr(config, 'use_positional_embedding', False):
+            self.pos_embed = nn.Parameter(torch.zeros(1, self.latent_dim))
+            nn.init.normal_(self.pos_embed, std=0.02)        
     def setup_schedule(self):
         """Enhanced schedule for latent diffusion"""
         steps = self.config.num_diffusion_steps

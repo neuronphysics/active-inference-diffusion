@@ -88,6 +88,7 @@ def train_diffusion_active_inference(
         consistency_weight=0.1,
         kl_weight=0.1,
         diffusion_weight=1.0,
+        pixel_observation=use_pixels,
         device=device
     )
     
@@ -108,7 +109,7 @@ def train_diffusion_active_inference(
         learning_starts=10_000,
         gradient_steps=2,
         exploration_noise=0.1,
-        exploration_decay=0.999
+        exploration_decay=0.999,
     )
     
     # Create agent
