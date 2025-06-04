@@ -24,7 +24,8 @@ class LatentScoreNetwork(nn.Module):
         hidden_dim: int = 256,
         time_embed_dim: int = 128,
         num_layers: int = 6,
-        use_attention: bool = True
+        use_attention: bool = True,
+        output_scale: float = 1e-3,
     ):
         super().__init__()
         
@@ -35,6 +36,7 @@ class LatentScoreNetwork(nn.Module):
         self.num_heads = 8
         self.mlp_ratio = 4.0
         self.use_attention = use_attention
+        self.output_scale = output_scale
         # Time embedding - FIXED to output hidden_dim
         self.time_embed = nn.Sequential(
             SinusoidalPositionEmbeddings(time_embed_dim),
@@ -55,6 +57,21 @@ class LatentScoreNetwork(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
         )
+        self.continuous_time_embed = nn.Sequential(
+            nn.Linear(1, time_embed_dim),
+            nn.SiLU(),
+            nn.Linear(time_embed_dim, time_embed_dim),
+            nn.SiLU(),
+            nn.Linear(time_embed_dim, hidden_dim)
+        )
+        
+        # ADD time scale learnable parameter for annealing
+        self.time_scale = nn.Parameter(torch.tensor(1.0))
+        
+        # Add gradient norm tracking for stability
+        self.register_buffer('grad_norm_ema', torch.tensor(1.0))
+        self.grad_norm_decay = 0.999
+
         
         # Input projection for latent
         self.latent_proj = nn.Linear(latent_dim, hidden_dim)
@@ -77,7 +94,7 @@ class LatentScoreNetwork(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, latent_dim, bias=False)
         )
-        
+        self.output_multiplier = nn.Parameter(torch.ones(1) * output_scale)
         # Initialize output to zero for stability
         nn.init.zeros_(self.output_proj[-1].weight)
         
@@ -101,6 +118,28 @@ class LatentScoreNetwork(nn.Module):
         # Embed time
         t_emb = self.time_embed(time)
         batch_size = z_t.shape[0]
+        is_continuous = time.max() <= 1.0 and time.min() >= 0.0
+    
+        if is_continuous:
+            # Continuous time path (for training with annealing)
+            # Scale continuous time for sinusoidal embedding
+            discrete_equivalent = time * 999.0  # Map [0,1] to [0,999]
+            t_sin = self.time_embed(discrete_equivalent)
+        
+            # Also use continuous embedding
+            normalized_time = 2.0 * time.view(-1, 1) - 1.0  # [-1, 1]
+            t_cont = self.continuous_time_embed(normalized_time)
+        
+            # Combine both with learned weighting
+            t_emb = t_sin + self.time_scale * t_cont
+        
+            # Add time-dependent output scaling for annealing
+            time_weight = torch.sqrt(1.0 / (1e-5 + time.view(-1, 1)))
+        else:
+            # Discrete time path (for backward compatibility)
+            t_emb = self.time_embed(time)
+            time_weight = 1.0
+
         # Encode observation
         if observation is not None:
             obs_emb = self.obs_encoder(observation)
@@ -124,7 +163,10 @@ class LatentScoreNetwork(nn.Module):
         # Final norm and output
         h = self.norm_final(h, conditioning)
         score = self.output_proj(h)
-        
+        score = score * self.output_multiplier  # Scale output
+        if is_continuous:
+            # Apply time-dependent scaling for continuous time
+            score = score * time_weight
         return score
 
 

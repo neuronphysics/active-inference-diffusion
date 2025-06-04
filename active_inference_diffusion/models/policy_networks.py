@@ -27,7 +27,7 @@ class DiffusionConditionedPolicy(nn.Module):
         log_std_min: float = -20,
         log_std_max: float = 2,
         use_state_dependent_std: bool = True,
-        squash_output: bool = True
+        squash_output: bool = False
     ):
         super().__init__()
         

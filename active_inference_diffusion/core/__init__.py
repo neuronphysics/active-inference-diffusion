@@ -1,7 +1,7 @@
 """
 Core modules for Active Inference + Diffusion
 """
-from .active_inference import DiffusionActiveInference
+from .active_inference import DiffusionActiveInference, EMAModel
 from .diffusion import LatentDiffusionProcess
 from .belief_dynamics import BeliefDynamics
 from .free_energy import FreeEnergyComputation
@@ -22,5 +22,6 @@ __all__ = [
     "PixelObservationConfig",
     "TrainingConfig",
     "DiffusionConfig",
-    "BeliefDynamicsConfig"
+    "BeliefDynamicsConfig",
+    "EMAModel"
 ]

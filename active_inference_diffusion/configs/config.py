@@ -15,7 +15,11 @@ class DiffusionConfig:
     beta_end: float = 0.02
     beta_schedule: str = "cosine"  # Options: "cosine", "linear"
     prediction_type: str = "score"
-
+    use_continuous_time: bool = True
+    time_annealing_start: float = 1.0
+    time_annealing_end: float = 0.1
+    annealing_steps: int = 100000
+    gradient_clip_val: float = 0.1
     
 @dataclass
 class BeliefDynamicsConfig:
@@ -61,7 +65,18 @@ class ActiveInferenceConfig:
     batch_size: int = 256
     learning_rate: float = 3e-4
     gradient_clip: float = 1.0
+
+    # Reward-oriented Active Inference parameters
+    preference_temperature: float = 1.0  # τ in P(o) ∝ exp(r(o)/τ)
+    preference_learning_rate: float = 0.01  # For adaptive temperature
+    min_preference_temperature: float = 0.1  # Lower bound for exploration
+    max_preference_temperature: float = 10.0  # Upper bound for exploration
+    temperature_decay: float = 0.995  # Exponential decay per episode
+    use_reward_preferences: bool = True  # Enable reward-oriented EFE
     
+    # Preference shaping parameters
+    baseline_reward: float = 0.0  # Baseline for reward centering
+    preference_momentum: float = 0.9  # EMA for reward statistics    
     # Nested configs
     diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
     belief_dynamics: BeliefDynamicsConfig = field(default_factory=BeliefDynamicsConfig)
@@ -74,7 +89,7 @@ class PixelObservationConfig:
     """Configuration for pixel observations"""
     image_shape: Tuple[int, int, int] = (3, 84, 84)
     frame_stack: int = 3
-    encoder_type: str = "drqv2"  # drqv2, impala, attention
+    encoder_type: str = "multiview"  # drqv2, impala, attention
     encoder_feature_dim: int = 50
     augmentation: bool = True
     random_shift_pad: int = 4

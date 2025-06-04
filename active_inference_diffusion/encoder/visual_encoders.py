@@ -147,6 +147,7 @@ class ConvDecoder(nn.Module):
         self,
         latent_dim: int,
         output_dim: int,
+        img_channels: int = 3,
         hidden_dim: int = 256,
         spatial_size: int = 7,  # Intermediate spatial dimension
         num_conv_layers: int = 3
@@ -162,7 +163,8 @@ class ConvDecoder(nn.Module):
         self.latent_proj = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim * spatial_size * spatial_size),
             nn.LayerNorm(hidden_dim * spatial_size * spatial_size),
-            nn.ReLU()
+            nn.ReLU(),
+            nn.Dropout(0.2)
         )
         
         # Convolutional decoder layers
@@ -172,13 +174,13 @@ class ConvDecoder(nn.Module):
         for i in range(num_conv_layers):
             in_channels = hidden_dim if i == 0 else hidden_dim // (2 ** i)
             out_channels = hidden_dim // (2 ** (i + 1))
-            
+            upsample =(i < num_conv_layers - 1)  # Last layer does not upsample
             # Add residual block with upsampling
             conv_layers.append(
                 ResidualUpsampleBlock(
                     in_channels=in_channels,
                     out_channels=out_channels,
-                    upsample=True if i < num_conv_layers - 1 else False
+                    upsample=upsample
                 )
             )
         
@@ -186,12 +188,11 @@ class ConvDecoder(nn.Module):
         
         # Final projection to output dimension
         # This collapses spatial dimensions back to feature vector
+        #image X_scaled = X_rgb / 255  # now in [0, 1]
         final_channels = hidden_dim // (2 ** num_conv_layers)
         self.output_proj = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),  # Global average pooling
-            nn.Flatten(),
-            nn.Linear(final_channels, output_dim),
-            nn.LayerNorm(output_dim)
+            nn.Conv2d(final_channels, img_channels, kernel_size=3, padding=1),
+            nn.Sigmoid()
         )
         
     def forward(self, latent: torch.Tensor) -> torch.Tensor:
@@ -211,7 +212,7 @@ class ConvDecoder(nn.Module):
         h = self.conv_decoder(h)
         
         # Project to output dimension
-        output = self.output_proj(h)
+        output = self.output_proj(h) #(B, img_channels, H, W)
         
         return output
 
@@ -246,6 +247,7 @@ class ResidualUpsampleBlock(nn.Module):
         layers.extend([
             nn.BatchNorm2d(out_channels),
             nn.ReLU(),
+            nn.Dropout(0.2),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels)
         ])

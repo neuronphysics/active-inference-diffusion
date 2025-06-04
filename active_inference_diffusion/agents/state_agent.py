@@ -102,6 +102,10 @@ class DiffusionStateAgent(BaseActiveInferenceAgent):
             next_latents = next_belief_info['latent']
         
         # 2. Train diffusion components
+        torch.nn.utils.clip_grad_norm_(
+            self.active_inference.latent_score_network.parameters(),
+            0.1
+        )  # Clip gradients of score network
         self.score_optimizer.zero_grad()
         elbo_loss, elbo_info = self.active_inference.compute_diffusion_elbo(
             observations, normalized_rewards, latents
@@ -113,6 +117,7 @@ class DiffusionStateAgent(BaseActiveInferenceAgent):
             self.config.gradient_clip
         )
         self.score_optimizer.step()
+        self.score_ema.update()
         metrics.update(elbo_info)
         
         # 3. Train policy network

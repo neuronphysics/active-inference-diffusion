@@ -39,6 +39,70 @@ class LatentDiffusionProcess(nn.Module):
         if getattr(config, 'use_positional_embedding', False):
             self.pos_embed = nn.Parameter(torch.zeros(1, self.latent_dim))
             nn.init.normal_(self.pos_embed, std=0.02)        
+
+        # Add continuous time support
+        self.continuous_time = True
+        self.time_min = 1e-5
+        self.time_max = 1.0
+        
+        # Add learnable log-SNR interpolation
+        self.log_snr_min = nn.Parameter(torch.tensor(-10.0))
+        self.log_snr_max = nn.Parameter(torch.tensor(10.0))
+        
+        # Loss weight annealing
+        self.register_buffer('loss_weight_cache', torch.zeros(1000))
+        self.loss_weight_computed = False
+        
+    def compute_log_snr(self, t: torch.Tensor) -> torch.Tensor:
+        """Compute log signal-to-noise ratio for continuous time"""
+        # Interpolate log-SNR based on continuous time
+        log_snr = self.log_snr_min + (self.log_snr_max - self.log_snr_min) * (1 - t)
+        return log_snr
+    
+    def continuous_q_sample(
+        self,
+        z_start: torch.Tensor,
+        t: torch.Tensor,  # Now continuous in [0, 1]
+        noise: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        """Enhanced q_sample for continuous time"""
+        if noise is None:
+            noise = torch.randn_like(z_start)
+            
+        # Compute continuous time parameters
+        log_snr = self.compute_log_snr(t)
+        alpha = torch.sigmoid(log_snr)
+        sigma = torch.sigmoid(-log_snr)
+        
+        # Reshape for broadcasting
+        alpha = alpha.view(-1, 1)
+        sigma = sigma.view(-1, 1)
+        
+        # Sample
+        z_noisy = torch.sqrt(alpha) * z_start + torch.sqrt(sigma) * noise
+        
+        # Return additional info for loss computation
+        info = {
+            'log_snr': log_snr,
+            'alpha': alpha,
+            'sigma': sigma
+        }
+        
+        return z_noisy, noise, info
+    
+    def compute_loss_weight(self, t: torch.Tensor) -> torch.Tensor:
+        """Compute annealed loss weight based on time"""
+        log_snr = self.compute_log_snr(t)
+        
+        # Annealing weight: emphasize middle timesteps
+        # This helps prevent explosion at t≈0 or t≈1
+        weight = torch.exp(-0.5 * (log_snr ** 2) / 4.0)
+        
+        # Additional stability weight
+        time_weight = torch.sin(t * np.pi) + 0.1  # Never zero
+        
+        return weight * time_weight
+
     def setup_schedule(self):
         """Enhanced schedule for latent diffusion"""
         steps = self.config.num_diffusion_steps

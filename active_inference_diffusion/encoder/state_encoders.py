@@ -99,6 +99,7 @@ class MultiViewEncoder(nn.Module):
             self.fusion_layer = nn.Sequential(
                 nn.Linear(total_features, feature_dim * 2),
                 nn.ReLU(),
+                nn.Dropout(0.2),
                 nn.Linear(feature_dim * 2, feature_dim),
                 nn.Tanh()
             )

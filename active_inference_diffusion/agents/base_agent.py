@@ -11,7 +11,7 @@ from typing import Dict, Tuple, Optional, Union, Any
 from abc import ABC, abstractmethod
 import gymnasium as gym
 
-from ..core.active_inference import DiffusionActiveInference
+from ..core.active_inference import EMAModel
 from ..encoder.visual_encoders import RandomShiftAugmentation
 from ..encoder.state_encoders import StateEncoder, EncoderFactory
 from ..utils.buffers import ReplayBuffer
@@ -64,12 +64,18 @@ class BaseActiveInferenceAgent(ABC):
         self.config = config
         self.training_config = training_config
         self.device = torch.device(config.device)
-        
         # Get environment dimensions
         self._setup_dimensions()
         
         # Create models
         self._build_models()
+        # Add EMA for score network
+        self.score_ema = EMAModel(
+            self.active_inference.latent_score_network,
+            decay=0.9999,
+            device=self.device
+        )       
+
         
         # Create optimizers
         self._setup_optimizers()

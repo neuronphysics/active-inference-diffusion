@@ -293,7 +293,8 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
             
             next_belief_info = self.active_inference.update_belief_via_diffusion(encoded_next_obs)
             next_latents = next_belief_info['latent']
-            
+        torch.nn.utils.clip_grad_norm_(self.active_inference.latent_score_network.parameters(),
+                                       0.1)    
         # 3. Train diffusion components
         self.score_optimizer.zero_grad()
         elbo_loss, elbo_info = self.active_inference.compute_diffusion_elbo(
@@ -316,6 +317,7 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
             self.config.gradient_clip
         )
         self.score_optimizer.step()
+        self.score_ema.update()
         
         metrics.update(elbo_info)
         metrics['contrastive_loss'] = contrastive_loss.item()
