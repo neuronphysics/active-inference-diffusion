@@ -36,7 +36,7 @@ wandb/
 runs/
 videos/
 *.mp4
-
+plots/
 # OS
 .DS_Store
 Thumbs.db

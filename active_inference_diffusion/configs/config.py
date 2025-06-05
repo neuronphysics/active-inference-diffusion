@@ -100,7 +100,7 @@ class TrainingConfig:
     """Training configuration"""
     # General
     total_timesteps: int = 1_000_000
-    eval_frequency: int = 10_000
+    eval_frequency: int = 5_000
     save_frequency: int = 50_000
     log_frequency: int = 1_000
     
@@ -111,10 +111,10 @@ class TrainingConfig:
     
     # Buffer
     buffer_size: int = 100_000
-    learning_starts: int = 10_000
+    learning_starts: int = 5_000
     train_frequency: int = 2
     gradient_steps: int = 2
-    
+    num_parallel_envs: int = 6  # Number of parallel environments for training
     # Evaluation
     num_eval_episodes: int = 10
     

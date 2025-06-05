@@ -37,7 +37,7 @@ class DiffusionActiveInference(nn.Module):
         self.action_dim = action_dim
         self.latent_dim = latent_dim
         self.config = config
-        
+        self.epistemic_dropout_rate = 0.2 
         # Initialize components
         self._build_models()
         
@@ -54,7 +54,7 @@ class DiffusionActiveInference(nn.Module):
         self.register_buffer('reward_mean', torch.tensor(0.0))
         self.register_buffer('reward_var', torch.tensor(1.0))
         self.register_buffer('preference_temperature', torch.tensor(self.config.preference_temperature))
-        self
+    
 
         # Score network for latent generation
         
@@ -99,16 +99,19 @@ class DiffusionActiveInference(nn.Module):
                 nn.Linear(self.latent_dim, self.config.hidden_dim * 2),
                 nn.LayerNorm(self.config.hidden_dim * 2),
                 nn.SiLU(),
+                nn.Dropout(self.epistemic_dropout_rate),
                 ),
                 nn.Sequential(
                 nn.Linear(self.config.hidden_dim * 2, self.config.hidden_dim * 2),
                 nn.LayerNorm(self.config.hidden_dim * 2),
                 nn.SiLU(),
+                nn.Dropout(self.epistemic_dropout_rate),
                ),
                 nn.Sequential(
                 nn.Linear(self.config.hidden_dim * 2, self.config.hidden_dim),
                 nn.LayerNorm(self.config.hidden_dim),
                 nn.SiLU(),
+                nn.Dropout(self.epistemic_dropout_rate),
                ),
                nn.Linear(self.config.hidden_dim, self.observation_dim)
                ])
@@ -289,6 +292,9 @@ class DiffusionActiveInference(nn.Module):
     ) -> torch.Tensor:
         # Compute epistemic value: H(o|s,π) - H(o|s,θ,π)
         # Epistemic value (ambiguity - observation uncertainty)
+        #- H[p(o|s,π)] is entropy marginalizing over model parameters (using dropout)
+        #- H[p(o|s,θ,π)] is entropy for a fixed set of parameters
+
         batch_size = next_latent_mean.shape[0]
         device = next_latent_mean.device
         
@@ -630,17 +636,15 @@ class DiffusionActiveInference(nn.Module):
         indices = (t * 99).long().clamp(0, 99)
     
         # Update weights with EMA
-        for idx, l in zip(indices.cpu.numpy(), loss.cpu.numpy()):
-            idx= int(idx)
-            l_value = float(l)
+        for idx in range(len(indices)):
+            idx = indices[idx].item()  # Convert to scalar index
             # Get current weight as a scalar
-            current_weight = float(self.time_importance_weights[idx].item())
-        
-            # Update with EMA
-            new_weight = 0.99 * current_weight + 0.01 * l_value
         
             # Set the new weight
-            self.time_importance_weights[idx] = new_weight     
+            self.time_importance_weights[idx] =(
+            0.99 * self.time_importance_weights[idx].item() + 
+            0.01 * loss[idx].item()
+          )    
 
 def extract(a: torch.Tensor, t: torch.Tensor, x_shape: Tuple) -> torch.Tensor:
     """Extract coefficients helper"""
