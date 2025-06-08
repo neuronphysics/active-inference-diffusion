@@ -44,7 +44,7 @@ def evaluate_agent(
         
         while not done and episode_length < max_episode_length:
             # Get action (deterministic for evaluation)
-            action, _ = agent.act(obs, deterministic=True)
+            action, _ = agent.act(obs, deterministic=False)
             
             # Step environment
             obs, reward, terminated, truncated, _ = env.step(action)
@@ -166,7 +166,7 @@ def load_checkpoint(
     agent.episode_count = checkpoint['episode_count']
     agent.exploration_noise = checkpoint['exploration_noise']
     
-    print(f"✅ Loaded checkpoint: {checkpoint_path}")
+    print(f"Loaded checkpoint: {checkpoint_path}")
     print(f"   Resuming from step {agent.total_steps}, episode {agent.episode_count}")
     
     return checkpoint

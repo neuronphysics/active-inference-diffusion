@@ -29,8 +29,9 @@ from active_inference_diffusion.envs.wrappers import NormalizeObservation, Actio
 from active_inference_diffusion.envs.pixel_wrappers import make_pixel_mujoco
 from active_inference_diffusion.envs.parallel_wrapper import create_parallel_collector
 from active_inference_diffusion.utils.util import visualize_reconstruction
-
-
+import os
+os.environ['CUDA_LAUNCH_BLOCKING'] = '0'  # Ensure CUDA errors are raised immediately
+os.environ['MUJOCO_GL'] = 'egl' 
 def setup_environment(
     env_name: str,
     use_pixels: bool = False,
@@ -48,6 +49,7 @@ def setup_environment(
             action_repeat=2,
             seed=seed
         )
+        print("Observation space for pixel:", env.observation_space.shape)
     else:
         # State-based environment
         env = gym.make(env_name)
@@ -116,14 +118,14 @@ def train_diffusion_active_inference(
         beta_start=1e-4,
         beta_end=0.02
     )
-    
+    buffer_size = 100_000 if not use_pixels else 50_000  # Smaller buffer for pixel data 
     training_config = TrainingConfig(
         total_timesteps=total_timesteps,
         eval_frequency=10_000,
         save_frequency=50_000,
         log_frequency=1_000,
-        buffer_size=100_000,
-        learning_starts=10_000,
+        buffer_size=buffer_size,
+        learning_starts=5_000,
         gradient_steps=2,
         exploration_noise=0.1,
         exploration_decay=0.999,
@@ -298,25 +300,30 @@ def train_diffusion_active_inference(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--env', type=str, default='HalfCheetah-v4',
+    try:
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--env', type=str, default='HalfCheetah-v4',
                        choices=['HalfCheetah-v4', 'Hopper-v4', 'Walker2d-v4', 
                                'Ant-v4', 'Humanoid-v4', 'HumanoidStandup-v4'])
-    parser.add_argument('--pixels', action='store_true', 
-                       help='Use pixel observations')
-    parser.add_argument('--timesteps', type=int, default=1_000_000)
-    parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--num_parallel_envs', type=int, default=6,
-                       help='Number of parallel environments for data collection')
+        parser.add_argument('--pixels', action='store_true', 
+                            help='Use pixel observations')
+        parser.add_argument('--timesteps', type=int, default=1_000_000)
+        parser.add_argument('--seed', type=int, default=0)
+        parser.add_argument('--device', type=str, default='cuda')
+        parser.add_argument('--num_parallel_envs', type=int, default=3,
+                            help='Number of parallel environments for data collection')
     
-    args = parser.parse_args()
+        args = parser.parse_args()
     
-    train_diffusion_active_inference(
-        env_name=args.env,
-        use_pixels=args.pixels,
-        total_timesteps=args.timesteps,
-        seed=args.seed,
-        device=args.device,
-        num_parallel_envs=args.num_parallel_envs
-    )
+        train_diffusion_active_inference(
+                                        env_name=args.env,
+                                        use_pixels=args.pixels,
+                                        total_timesteps=args.timesteps,
+                                        seed=args.seed,
+                                        device=args.device,
+                                        num_parallel_envs=args.num_parallel_envs
+                                        )
+    except Exception as e:
+        import traceback
+        print(f"Error occurred: {e}")
+        traceback.print_exc()

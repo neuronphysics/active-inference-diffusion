@@ -180,7 +180,7 @@ class DiffusionStateAgent(BaseActiveInferenceAgent):
         self.dynamics_optimizer.zero_grad()
         
         # Predict next latents
-        predicted_next_latents = self.active_inference.predict_next_latent(latents, actions)
+        predicted_next_latents, predict_next_logvar = self.active_inference.predict_next_latent(latents, actions)
         
         # Dynamics loss
         dynamics_loss = F.mse_loss(predicted_next_latents, next_latents)

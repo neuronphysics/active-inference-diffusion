@@ -1,73 +1,126 @@
-from ..agents.pixel_agent import DiffusionPixelAgent
-from ..agents.state_agent import DiffusionStateAgent
 import torch
 import matplotlib.pyplot as plt
-
-def visualize_reconstruction(agent, observations, save_path="reconstruction.png"):
+import torch.nn as nn
+import numpy as np
+import torch.nn.functional as F
+from typing import Optional, Union
+def visualize_reconstruction(
+    agent,  # Type annotation removed to avoid circular import
+    observations: torch.Tensor,
+    save_path: Optional[str] = None,
+    max_samples: int = 4
+) -> float:
     """
-    Visualize original vs reconstructed observations for debugging.
-    Works for both state and pixel observations.
-    """
+    Visualize observation reconstruction through the diffusion latent space.
+    Works for both pixel and state observations.
     
+    This function demonstrates how observations are encoded to latents
+    and then decoded back, which is crucial for computing epistemic value.
+    """
+    device = observations.device
+    
+    # Ensure we're in eval mode
+    was_training = agent.active_inference.training
+    agent.active_inference.eval()
     
     with torch.no_grad():
-        # Process observations
-        if isinstance(agent, DiffusionPixelAgent):
-            # For pixel agent, encode first
-            encoded = agent.encode_observation(observations)
-            belief_info = agent.active_inference.update_belief_via_diffusion(encoded)
-        elif isinstance(agent, DiffusionStateAgent):
-            # For state agent
-            belief_info = agent.active_inference.update_belief_via_diffusion(observations)
+        # Move observations to device
+        if observations.device != device:
+            observations = observations.to(device)
+            
+        # For pixel observations, we need to encode them first
+        if hasattr(agent, 'encoder') and agent.config.pixel_observation:
+            # Encode pixel observations to features
+            encoded_obs = agent.encode_observation(observations[:max_samples])
+        else:
+            # For state observations, use them directly
+            encoded_obs = observations[:max_samples]
         
+        # Generate latents via diffusion
+        belief_info = agent.active_inference.update_belief_via_diffusion(encoded_obs)
         latents = belief_info['latent']
         
-        # Reconstruct
-        reconstructed = agent.active_inference.decode_observation(latents)
+        # Decode latents back to observation space
+        reconstructed_obs = agent.active_inference.decode_observation(latents)
         
-        # Handle different observation types
-        if len(observations.shape) == 4:  # RGB: (B, C, H, W)
-            # Take first 4 samples
-            n_samples = min(4, observations.shape[0])
-            fig, axes = plt.subplots(2, n_samples, figsize=(n_samples*3, 6))
-            
-            for i in range(n_samples):
-                # Original
-                img = observations[i].cpu().permute(1, 2, 0).numpy()
-                if img.max() <= 1.0:
-                    img = img  # Already normalized
-                else:
-                    img = img / 255.0
-                axes[0, i].imshow(img)
-                axes[0, i].set_title(f"Original {i}")
-                axes[0, i].axis('off')
+        # For pixel observations, we need to handle the output differently
+        if agent.config.pixel_observation:
+            # Pixel reconstruction
+            if save_path:
+                fig, axes = plt.subplots(2, max_samples, figsize=(max_samples * 3, 6))
                 
-                # Reconstructed 
-                recon = reconstructed[i].cpu().permute(1, 2, 0).numpy()
-                axes[1, i].imshow(recon)
-                axes[1, i].set_title(f"Reconstructed {i}")
-                axes[1, i].axis('off')
+                for i in range(min(max_samples, observations.shape[0])):
+                    # Original observation
+                    if observations.shape[1] > 3:  # Frame stacked
+                        # Show only the most recent frame
+                        orig = observations[i, -3:].cpu().numpy()
+                    else:
+                        orig = observations[i].cpu().numpy()
+                    
+                    # Handle channel format
+                    if orig.shape[0] == 3:  # (C, H, W)
+                        orig = np.transpose(orig, (1, 2, 0))
+                    
+                    # Reconstructed observation
+                    recon = reconstructed_obs[i].cpu().numpy()
+                    if recon.shape[0] == 3:  # (C, H, W)
+                        recon = np.transpose(recon, (1, 2, 0))
+                    
+                    # Ensure values are in [0, 1]
+                    orig = np.clip(orig, 0, 1)
+                    recon = np.clip(recon, 0, 1)
+                    
+                    # Plot
+                    axes[0, i].imshow(orig)
+                    axes[0, i].set_title(f'Original {i}')
+                    axes[0, i].axis('off')
+                    
+                    axes[1, i].imshow(recon)
+                    axes[1, i].set_title(f'Reconstructed {i}')
+                    axes[1, i].axis('off')
                 
-        else:  # State observations
-            # Plot state dimensions
-            fig, ax = plt.subplots(1, 1, figsize=(10, 6))
-            x = range(observations.shape[-1])
+                plt.tight_layout()
+                plt.savefig(save_path, dpi=150, bbox_inches='tight')
+                plt.close()
             
-            # Plot first few samples
-            n_samples = min(3, observations.shape[0])
-            for i in range(n_samples):
-                ax.plot(x, observations[i].cpu(), 'o-', label=f'Original {i}', alpha=0.7)
-                ax.plot(x, reconstructed[i].cpu(), 's--', label=f'Reconstructed {i}', alpha=0.7)
+            # Compute reconstruction error
+            if observations.shape == reconstructed_obs.shape:
+                recon_error = F.mse_loss(reconstructed_obs, observations[:max_samples]).item()
+            else:
+                # If shapes don't match (e.g., frame stacking), compare encoded features
+                recon_error = F.mse_loss(reconstructed_obs, encoded_obs).item()
+                
+        else:
+            # State reconstruction
+            recon_error = F.mse_loss(reconstructed_obs, observations[:max_samples]).item()
             
-            ax.set_xlabel('State Dimension')
-            ax.set_ylabel('Value')
-            ax.set_title('State Reconstruction Comparison')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
+            if save_path:
+                fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+                
+                # Plot first few dimensions
+                dims_to_plot = min(5, observations.shape[1])
+                x = np.arange(dims_to_plot)
+                
+                for i in range(min(max_samples, observations.shape[0])):
+                    orig = observations[i, :dims_to_plot].cpu().numpy()
+                    recon = reconstructed_obs[i, :dims_to_plot].cpu().numpy()
+                    
+                    offset = i * 0.2
+                    ax.plot(x, orig + offset, 'o-', label=f'Original {i}', alpha=0.7)
+                    ax.plot(x, recon + offset, 's--', label=f'Recon {i}', alpha=0.7)
+                
+                ax.set_xlabel('State Dimension')
+                ax.set_ylabel('Value (offset for clarity)')
+                ax.set_title('State Reconstruction Quality')
+                ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+                ax.grid(True, alpha=0.3)
+                
+                plt.tight_layout()
+                plt.savefig(save_path, dpi=150, bbox_inches='tight')
+                plt.close()
     
-    plt.suptitle(f'Reconstruction Error: {belief_info["reconstruction_error"]:.4f}')
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close()
+    # Restore training mode
+    if was_training:
+        agent.active_inference.train()
     
-    return belief_info["reconstruction_error"].item()
+    return recon_error

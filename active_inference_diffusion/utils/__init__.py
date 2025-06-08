@@ -7,7 +7,7 @@ from .training import (
     create_video,
     plot_training_curves
 )
-
+from .util import visualize_reconstruction
 __all__ = [
     "ReplayBuffer",
     "Logger",
@@ -16,4 +16,5 @@ __all__ = [
     "load_checkpoint",
     "create_video",
     "plot_training_curves",
+    "visualize_reconstruction",
 ]

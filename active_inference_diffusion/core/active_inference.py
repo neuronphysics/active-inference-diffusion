@@ -14,6 +14,7 @@ from ..models.score_networks import LatentScoreNetwork
 from ..models.policy_networks import DiffusionConditionedPolicy
 from ..models.value_networks import ValueNetwork
 from ..models.dynamics_models import LatentDynamicsModel
+
 class DiffusionActiveInference(nn.Module):
     """
     Core Active Inference implementation with diffusion-generated latents
@@ -29,7 +30,8 @@ class DiffusionActiveInference(nn.Module):
         observation_dim: int,
         action_dim: int,
         latent_dim: int,
-        config: 'ActiveInferenceConfig'
+        config: 'ActiveInferenceConfig',
+        pixel_shape: Optional[Tuple[int, int, int]] = None
     ):
         super().__init__()
         
@@ -37,7 +39,14 @@ class DiffusionActiveInference(nn.Module):
         self.action_dim = action_dim
         self.latent_dim = latent_dim
         self.config = config
+        self.pixel_shape = pixel_shape 
+        self.is_pixel_observation = config.pixel_observation
         self.epistemic_dropout_rate = 0.2 
+        if self.is_pixel_observation and pixel_shape is not None:
+            self.raw_observation_shape = pixel_shape
+        else:
+            self.raw_observation_shape = None
+            
         # Initialize components
         self._build_models()
         
@@ -49,7 +58,9 @@ class DiffusionActiveInference(nn.Module):
         """Build core models for diffusion active inference"""
    
         # Latent diffusion process
-        self.latent_diffusion = LatentDiffusionProcess(self.config.diffusion, latent_dim=self.latent_dim)
+        self.latent_diffusion = LatentDiffusionProcess(
+                                                       self.config.diffusion, 
+                                                       latent_dim=self.latent_dim)
         # Add reward preference components
         self.register_buffer('reward_mean', torch.tensor(0.0))
         self.register_buffer('reward_var', torch.tensor(1.0))
@@ -60,7 +71,7 @@ class DiffusionActiveInference(nn.Module):
         
         self.latent_score_network = LatentScoreNetwork(
             latent_dim=self.latent_dim,
-            observation_dim=self.observation_dim,
+            observation_dim=self.latent_dim,
             hidden_dim=self.config.hidden_dim,
             use_attention=True
         )
@@ -93,7 +104,7 @@ class DiffusionActiveInference(nn.Module):
         )
         
         # Observation decoder (latent -> observation prediction)
-        if not self.config.pixel_observation:
+        if not self.is_pixel_observation:
            self.observation_decoder = nn.ModuleList([
                 nn.Sequential(
                 nn.Linear(self.latent_dim, self.config.hidden_dim * 2),
@@ -115,13 +126,26 @@ class DiffusionActiveInference(nn.Module):
                ),
                nn.Linear(self.config.hidden_dim, self.observation_dim)
                ])
+            
         else:
             self.observation_decoder = ConvDecoder(
                 latent_dim=self.latent_dim,
-                output_dim=self.observation_dim,
+                output_dim=np.prod(self.pixel_shape),  # Total pixel count
+                img_channels=self.pixel_shape[0],
                 hidden_dim=self.config.hidden_dim,
-                num_conv_layers=3
+                spatial_size=21,
+                num_conv_layers=2  # More layers to reach 84x84
                 )
+            # Also add a feature decoder for reconstructing encoded features
+            self.feature_decoder = nn.Sequential(
+                nn.Linear(self.latent_dim, self.config.hidden_dim),
+                nn.LayerNorm(self.config.hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(self.epistemic_dropout_rate),
+                nn.Linear(self.config.hidden_dim, self.latent_dim),  # Decode to feature space
+                nn.Tanh()
+            )
+
         #initialize a reward predictor
         self.reward_predictor = nn.Sequential(
             nn.Linear(self.latent_dim, self.config.hidden_dim),
@@ -131,13 +155,24 @@ class DiffusionActiveInference(nn.Module):
             nn.ReLU(),
             nn.Linear(self.config.hidden_dim // 2, 2)
         )
-
-    def decode_observation(self, latent: torch.Tensor) -> torch.Tensor:
-        """Enhanced decoding with residual connections"""
-        if self.config.pixel_observation:
-            # For pixel observations, use convolutional decoder
-            return self.observation_decoder(latent)
-        else: #For non-pixel observations, use fully connected decoder
+    def decode_observation(self, latent: torch.Tensor, decode_to_pixels: bool = True) -> torch.Tensor:
+        """
+        decoding that can decode to either pixels or features
+        
+        Args:
+            latent: Latent representation
+            decode_to_pixels: If True and using pixel observations, decode to raw pixels.
+                            If False, decode to encoded feature space.
+        """
+        if self.is_pixel_observation:
+            if decode_to_pixels:
+                # Decode to pixel space
+                return self.observation_decoder(latent)
+            else:
+                # Decode to feature space (for reconstruction loss)
+                return self.feature_decoder(latent)
+        else:
+            # For non-pixel observations, use fully connected decoder
             h = latent
             # First layer
             h1 = self.observation_decoder[0](h)
@@ -148,6 +183,7 @@ class DiffusionActiveInference(nn.Module):
             h3 = self.observation_decoder[2](h2)
             # Output layer
             return self.observation_decoder[3](h3)
+        
 
     def predict_reward_from_latent(self, latent: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -159,20 +195,21 @@ class DiffusionActiveInference(nn.Module):
         return reward_mean, reward_std
     
 
-  
-
     def update_belief_via_diffusion(
         self,
-        observation: torch.Tensor
+        observation: torch.Tensor,
+        raw_observation: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
         Update belief using reverse diffusion process
         This is the core innovation - beliefs as diffusion-generated latents
         """
-        batch_size = observation.shape[0] if observation.dim() > 1 else 1
-        
+        # Handle different input shapes
         if observation.dim() == 1:
             observation = observation.unsqueeze(0)
+            batch_size = 1
+        else:
+            batch_size = observation.shape[0]
             
         # Generate latent via reverse diffusion conditioned on observation
         trajectory = self.latent_diffusion.generate_latent_trajectory(
@@ -187,20 +224,32 @@ class DiffusionActiveInference(nn.Module):
         self.latent_trajectory = trajectory
         
         # Compute latent statistics
-        latent_mean = self.current_latent.mean(dim=0)
-        latent_std = self.current_latent.std(dim=0)
+        if batch_size == 1:
+            latent_mean = self.current_latent.squeeze(0)
+            latent_std = torch.zeros_like(latent_mean)  # Single sample, no std
+        else:
+            latent_mean = self.current_latent.mean(dim=0)
+            latent_std = self.current_latent.std(dim=0)
         
         # Decode to observation space for validation
-        predicted_obs = self.decode_observation(self.current_latent)
-        reconstruction_error = F.mse_loss(predicted_obs, observation)
-        
+         # Compute reconstruction error appropriately
+        if self.is_pixel_observation:
+            # For pixel observations, decode to feature space and compare with encoded features
+            predicted_features = self.decode_observation(self.current_latent, decode_to_pixels=False)
+            reconstruction_error = F.mse_loss(predicted_features, observation)
+        else:
+            # For state observations, decode to state space
+            predicted_obs = self.decode_observation(self.current_latent)
+            reconstruction_error = F.mse_loss(predicted_obs, observation)
+         
         return {
             'latent': self.current_latent,
             'latent_mean': latent_mean,
             'latent_std': latent_std,
             'trajectory_length': len(trajectory),
             'reconstruction_error': reconstruction_error,
-            'observation': observation
+            'observation': observation,
+            'raw_observation': raw_observation,
         }
         
     def compute_expected_free_energy_diffusion(
@@ -284,6 +333,7 @@ class DiffusionActiveInference(nn.Module):
         }
         
         return total_efe, info
+    
     def compute_epistemic_value(
         self,   
         next_latent_mean: torch.Tensor,
@@ -304,11 +354,17 @@ class DiffusionActiveInference(nn.Module):
         entropy_obs_given_state_policy= torch.zeros(batch_size, device=device)
         self.train()
         observation=[]
-        # Term 2.1: Sample different parameters (dropout)
+        #  Term 1: H[p(o|s,π)] - entropy marginalizing over model parameters
         for _ in range(num_samples):
             # Different parameters each forward pass
             next_latent= self.reparameterize(next_latent_mean, next_latent_logvar)
-            po_temp = self.decode_observation(next_latent) 
+            if self.is_pixel_observation:
+                # Decode to feature space for epistemic computation
+                po_temp = self.decode_observation(next_latent, decode_to_pixels=True)
+                
+            else:
+                po_temp = self.decode_observation(next_latent)
+            
             observation.append(po_temp)
         obs_dropout = torch.stack(observation, dim=0)  # Shape: (num_samples, batch_size, obs_dim)
         if self.config.pixel_observation:
@@ -317,7 +373,7 @@ class DiffusionActiveInference(nn.Module):
             # Shape: (batch_size, obs_dim)
             p = torch.clamp(obs_dropout, 1e-8, 1-1e-8)
             entropy = - (p * torch.log(p) + (1-p) * torch.log(1-p))
-            entropy_obs_given_state_policy = entropy.mean(0).sum(dim=(1,2,3))
+            entropy_obs_given_state_policy = entropy.reshape(batch_size, -1).sum(dim=-1)  # Sum over pixel dimensions
         else:
             var_obs = obs_dropout.var( dim=0)+ 1e-8  # Add small constant for numerical stability
     
@@ -326,32 +382,35 @@ class DiffusionActiveInference(nn.Module):
     
             entropy_obs_given_state_policy=entropy.sum(dim=-1) 
         entropy_obs_given_state_theta_pi = torch.zeros(batch_size, device=device)    
-        # Sample different states (same parameters)
+        # Term 2: H[p(o|s,θ,π)] - entropy for fixed parameters
         self.eval()
         observation = []
         with torch.no_grad():
             for _ in range(num_samples):
                 # Sample from state distribution
                 state_sample = self.reparameterize(next_latent_mean, next_latent_logvar)
-                po_temp = self.decode_observation(state_sample)
+                if self.is_pixel_observation:
+                    po_temp = self.decode_observation(state_sample, decode_to_pixels=True)
+                else:
+                    po_temp = self.decode_observation(state_sample)
                 observation.append(po_temp)
             po_temp = torch.stack(observation, dim=0)  # Shape: (num_samples, batch_size, obs_dim)
             if self.config.pixel_observation:
                 # Shape: (batch_size, obs_dim)
                 p = torch.clamp(po_temp, 1e-8, 1-1e-8)
                 entropy = - (p * torch.log(p) + (1-p) * torch.log(1-p))
-                entropy_obs_given_state_theta_pi= entropy.mean(0).sum(dim=(1,2,3))
+                entropy_obs_given_state_theta_pi= entropy.reshape(batch_size, -1).sum(dim=-1)
             else:
                 state_var = torch.var(po_temp, dim=0)
                 # Differential entropy of Gaussian: 0.5 * log(2πe * σ²)
                 entropy = 0.5 * torch.log(2 * np.pi * np.e * state_var + 1e-8)
                 entropy_obs_given_state_theta_pi= entropy.sum(dim=-1) 
             
-                self.train(original_mode)  # Restore original training mode
-                # Epistemic value: H(o|s,π) - H(o|s,θ,π)
-                epistemic_value=entropy_obs_given_state_policy - entropy_obs_given_state_theta_pi
-                epistemic_value = torch.clamp(epistemic_value, min=0.0)  # Ensure non-negative
-                return epistemic_value
+        self.train(original_mode)  # Restore original training mode
+        # Epistemic value: H(o|s,π) - H(o|s,θ,π)
+        epistemic_value=entropy_obs_given_state_policy - entropy_obs_given_state_theta_pi
+        epistemic_value = torch.clamp(epistemic_value, min=0.0)  # Ensure non-negative
+        return epistemic_value
 
     def reparameterize(self, mean: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         std = torch.exp(0.5 * logvar)
@@ -385,17 +444,24 @@ class DiffusionActiveInference(nn.Module):
     def act(
         self,
         observation: torch.Tensor,
-        deterministic: bool = False
+        deterministic: bool = False,
+        raw_observation: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Select action using diffusion-generated latent active inference
         """
+        if observation.dim() == 1:
+            observation = observation.unsqueeze(0)
+
         # Update belief via diffusion
-        belief_info = self.update_belief_via_diffusion(observation)
+        belief_info = self.update_belief_via_diffusion(observation, raw_observation)
         
         # Current latent belief
         latent = belief_info['latent']
-        
+        # Ensure latent has proper shape for policy
+        if latent.dim() == 1:
+            latent = latent.unsqueeze(0)
+       
         # Compute expected free energy
         efe, efe_info = self.compute_expected_free_energy_diffusion(
             latent,
@@ -407,6 +473,9 @@ class DiffusionActiveInference(nn.Module):
             latent,
             deterministic=deterministic
         )
+        # Ensure action has proper shape
+        if action.dim() > 2:
+            action = action.squeeze()
         
         # Compile information
         info = {
@@ -423,7 +492,8 @@ class DiffusionActiveInference(nn.Module):
         self,
         observations: torch.Tensor,
         rewards: torch.Tensor,
-        latents: Optional[torch.Tensor] = None
+        latents: Optional[torch.Tensor] = None,
+        raw_observations: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Annealing time conditioned ELBO for diffusion-generated latents
@@ -437,14 +507,20 @@ class DiffusionActiveInference(nn.Module):
         # Generate latents if not provided
         if latents is None:
             # Use current belief generation
-            belief_info = self.update_belief_via_diffusion(observations)
+            belief_info = self.update_belief_via_diffusion(observations, raw_observations)
             latents = belief_info['latent']
 
                    
         # Reconstruction term
-        predicted_obs = self.decode_observation(latents)
-        reconstruction_loss = F.mse_loss(predicted_obs, observations)
-        
+        if self.is_pixel_observation:
+            # For pixel observations, reconstruct features
+            predicted_features = self.decode_observation(latents, decode_to_pixels=False)
+            reconstruction_loss = F.mse_loss(predicted_features, observations)
+        else:
+            # For state observations, reconstruct states
+            predicted_obs = self.decode_observation(latents)
+            reconstruction_loss = F.mse_loss(predicted_obs, observations)
+       
                 
         # Diffusion score matching loss
         # Sample continuous time with importance sampling
@@ -478,8 +554,8 @@ class DiffusionActiveInference(nn.Module):
         loss_weight = self.latent_diffusion.compute_loss_weight(t)
         # Score matching loss with annealing
         score_diff = predicted_score - true_score
-        
-        per_sample_losses = loss_weight.view(-1, 1) * torch.sum(score_diff ** 2, dim=-1)
+        #shape: (batch_size, latent_dim)
+        per_sample_losses = loss_weight.view(-1) * torch.sum(score_diff ** 2, dim=1)
         score_matching_loss = torch.mean(per_sample_losses)
 
         # Add gradient penalty for stability
@@ -536,7 +612,7 @@ class DiffusionActiveInference(nn.Module):
         device = rewards.device
     
         # Initialize returns storage
-        lambda_returns = torch.zeros_like(rewards)
+        lambda_returns = torch.zeros_like(rewards).to(device)
     
         # Compute n-step returns
         for idx in range(batch_size):
@@ -634,17 +710,17 @@ class DiffusionActiveInference(nn.Module):
     
         # Discretize time
         indices = (t * 99).long().clamp(0, 99)
-    
+        if loss.dim() > 1:
+           # If loss has multiple dimensions, reduce to scalar per sample
+           loss = loss.view(loss.shape[0], -1).sum(dim=1)
+
         # Update weights with EMA
-        for idx in range(len(indices)):
-            idx = indices[idx].item()  # Convert to scalar index
-            # Get current weight as a scalar
-        
-            # Set the new weight
-            self.time_importance_weights[idx] =(
-            0.99 * self.time_importance_weights[idx].item() + 
-            0.01 * loss[idx].item()
-          )    
+        for i in range(len(indices)):  
+            time_bin = indices[i].item()
+            sample_loss = loss[i].item()
+            current_weight = self.time_importance_weights[time_bin].item()
+            new_weight = 0.99 * current_weight + 0.01 * sample_loss
+            self.time_importance_weights[time_bin] = new_weight
 
 def extract(a: torch.Tensor, t: torch.Tensor, x_shape: Tuple) -> torch.Tensor:
     """Extract coefficients helper"""

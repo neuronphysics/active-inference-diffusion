@@ -108,53 +108,100 @@ class MuJoCoPixelObservationWrapper(gym.ObservationWrapper):
         # Alternative unwrapped access for gymnasium environments
         if hasattr(self.env, 'unwrapped'):
             base_env = self.env.unwrapped
-    
-        if self._render_mode == 'gymnasium':
-            # Modern gymnasium approach - use base environment's renderer
-            if self.camera_name is not None:
-                # Set camera before rendering
-                if hasattr(base_env, 'mujoco_renderer') and hasattr(base_env.mujoco_renderer, 'camera_name'):
-                    base_env.mujoco_renderer.camera_name = self.camera_name
-
-            pixels = base_env.mujoco_renderer.render(
-                render_mode='rgb_array',
-                camera_name=self.camera_name,
-                width=self.width,
-                height=self.height
-            )
-        else:
-            # Legacy mujoco-py approach
-            if self.camera_name is None:
-                pixels = base_env.sim.render(
-                    width=self.width,
-                    height=self.height,
-                    mode='offscreen',
-                    device_id=self.device_id
-                )
+        try:
+            if self._render_mode == 'gymnasium':
+                # For gymnasium environments, we need to handle rendering differently
+            
+                # First, check if we can use the environment's render method directly
+                if hasattr(base_env, 'render'):
+                    # Try to get the mujoco renderer and set its dimensions
+                    if hasattr(base_env, 'mujoco_renderer') and base_env.mujoco_renderer is not None:
+                        # Set width and height on the renderer itself if possible
+                        if hasattr(base_env.mujoco_renderer, 'width'):
+                            base_env.mujoco_renderer.width = self.width
+                        if hasattr(base_env.mujoco_renderer, 'height'):
+                            base_env.mujoco_renderer.height = self.height
+                    
+                        # Handle camera selection
+                        if self.camera_name is not None:
+                            if hasattr(base_env.mujoco_renderer, 'camera_name'):
+                                base_env.mujoco_renderer.camera_name = self.camera_name
+                            elif hasattr(base_env.mujoco_renderer, 'default_cam_config'):
+                                try:
+                                    if hasattr(base_env.mujoco_renderer, '_get_cam_config'):
+                                        cam_config = base_env.mujoco_renderer._get_cam_config(self.camera_name)
+                                        base_env.mujoco_renderer.default_cam_config = cam_config
+                                except:
+                                    pass
+                
+                    # Use the environment's render method
+                    pixels = base_env.render()
+                
+                    # If pixels are None or wrong size, try the renderer directly
+                    if pixels is None or pixels.shape[0] != self.height or pixels.shape[1] != self.width:
+                        if hasattr(base_env, 'mujoco_renderer') and base_env.mujoco_renderer is not None:
+                            # Try calling render without parameters
+                            pixels = base_env.mujoco_renderer.render('rgb_array')
+                        
+                else:
+                    raise RuntimeError("Environment doesn't have a render method")
+                
             else:
-                pixels = base_env.sim.render(
-                    width=self.width,
-                    height=self.height,
-                    camera_name=self.camera_name,
-                    mode='offscreen',
-                    device_id=self.device_id
-                )
+                # Legacy mujoco-py approach
+                if self.camera_name is None:
+                    pixels = base_env.sim.render(
+                        width=self.width,
+                        height=self.height,
+                        mode='offscreen',
+                        device_id=self.device_id
+                    )
+                else:
+                    pixels = base_env.sim.render(
+                        width=self.width,
+                        height=self.height,
+                        camera_name=self.camera_name,
+                        mode='offscreen',
+                        device_id=self.device_id
+                    )
     
-        # Flip vertically (OpenGL convention)
-        pixels = pixels[::-1, :, :]
+        except Exception as e:
+            # Fallback: try to use environment's render with default settings
+            print(f"Primary render failed: {e}. Trying fallback...")
+        
+            # Reset to base environment
+            env_to_render = self.env.unwrapped if hasattr(self.env, 'unwrapped') else self.env
+        
+            # Try simple render
+            pixels = env_to_render.render()
+        
+            if pixels is None:
+                raise RuntimeError(f"Failed to render pixels: {e}")
     
+        # Resize if needed
+        if pixels.shape[0] != self.height or pixels.shape[1] != self.width:
+            # Use PIL for resizing as it's more reliable than cv2 for this
+            from PIL import Image
+            img = Image.fromarray(pixels)
+            img = img.resize((self.width, self.height), Image.Resampling.LANCZOS)
+            pixels = np.array(img)
+    
+        # Flip vertically (OpenGL convention) - only if needed
+        # Check if image looks upside down by testing with a known environment
+        # For now, let's make this optional
+        if hasattr(self, '_flip_vertically') and self._flip_vertically:
+            pixels = pixels[::-1, :, :]
+
         # Convert to channels-first if requested
         if self.channels_first and pixels.shape[2] == 3:
             pixels = np.transpose(pixels, (2, 0, 1))
-    
+
         # Normalize if requested
         if self.normalize:
             pixels = pixels.astype(np.float32) / 255.0
         else:
             pixels = pixels.astype(np.uint8)
-        
-        return pixels
     
+        return pixels   
     def reset(self, **kwargs) -> Tuple[np.ndarray, Dict[str, Any]]:
         """Reset environment and return pixel observation."""
         obs, info = self.env.reset(**kwargs)
@@ -268,43 +315,19 @@ def make_pixel_mujoco(
     seed: Optional[int] = None,
     **kwargs
 ) -> gym.Env:
-    """
-    Create a pixel-based MuJoCo environment with common wrappers.
+    """Create a pixel-based MuJoCo environment with common wrappers."""
+    # Create base environment with render_mode
+    env = gym.make(env_id, render_mode='rgb_array')  # <-- Add render_mode here!
     
-    This function orchestrates a hierarchical wrapper composition that transforms
-    raw MuJoCo state-based environments into pixel-observation spaces suitable
-    for visual control learning paradigms.
-    
-    Args:
-        env_id: MuJoCo environment identifier
-        width: Rendered observation width (pixels)
-        height: Rendered observation height (pixels)
-        frame_stack: Temporal context via frame concatenation
-        action_repeat: Temporal action persistence factor
-        camera_name: MuJoCo camera perspective identifier
-        seed: Stochastic initialization seed
-        **kwargs: Additional MuJoCoPixelObservationWrapper parameters
-        
-    Returns:
-        Hierarchically wrapped environment with pixel observations
-    """
-    # Create base environment
-    env = gym.make(env_id)
-    
-    # Set seed if provided
+    # Rest of the function remains the same...
     if seed is not None:
         env.reset(seed=seed)
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
     
-    # Add action repeat wrapper if requested
-    # This implements temporal action persistence, reducing control frequency
-    # while maintaining physics simulation fidelity
     if action_repeat > 1:
-        env = ActionRepeat(env, repeat=action_repeat)  # Use your custom wrapper
+        env = ActionRepeat(env, repeat=action_repeat)
     
-    # Add pixel observation wrapper
-    # Transforms proprioceptive state space to visual observation space
     env = MuJoCoPixelObservationWrapper(
         env,
         width=width,
@@ -313,8 +336,6 @@ def make_pixel_mujoco(
         **kwargs
     )
     
-    # Add frame stacking if requested
-    # Provides temporal context through observation history
     if frame_stack > 1:
         env = gym.wrappers.FrameStackObservation(env, frame_stack)
     

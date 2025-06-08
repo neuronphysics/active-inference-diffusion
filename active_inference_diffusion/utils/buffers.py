@@ -34,10 +34,12 @@ class ReplayBuffer:
             self.observations = [None] * capacity
             self.next_observations = [None] * capacity
             self.compress = True
+            self.dtype = np.uint8
         else:
             self.observations = torch.zeros((capacity, *obs_shape), dtype=torch.float32)
             self.next_observations = torch.zeros((capacity, *obs_shape), dtype=torch.float32)
             self.compress = False
+            self.dtype = np.float32
             
         self.actions = torch.zeros((capacity, action_dim), dtype=torch.float32)
         self.rewards = torch.zeros(capacity, dtype=torch.float32)
@@ -53,11 +55,21 @@ class ReplayBuffer:
     ):
         """Add transition to buffer"""
         if self.compress:
-            # Compress pixel observations
+            # Ensure uint8 format for pixel observations
+            if obs.dtype != np.uint8:
+                if obs.max() <= 1.0:  # Normalized
+                    obs = (obs * 255).astype(np.uint8)
+                else:
+                    obs = obs.astype(np.uint8)
+            if next_obs.dtype != np.uint8:
+                if next_obs.max() <= 1.0:
+                    next_obs = (next_obs * 255).astype(np.uint8)
+                else:
+                    next_obs = next_obs.astype(np.uint8)
+                    
             self.observations[self.pos] = self._compress(obs)
             self.next_observations[self.pos] = self._compress(next_obs)
         else:
-            # Store directly
             self.observations[self.pos] = torch.from_numpy(obs)
             self.next_observations[self.pos] = torch.from_numpy(next_obs)
             

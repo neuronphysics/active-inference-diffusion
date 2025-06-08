@@ -89,10 +89,11 @@ class PixelObservationConfig:
     """Configuration for pixel observations"""
     image_shape: Tuple[int, int, int] = (3, 84, 84)
     frame_stack: int = 3
-    encoder_type: str = "multiview"  # drqv2, impala, attention
-    encoder_feature_dim: int = 50
+    encoder_type: str = "drqv2"  # drqv2, impala, attention
+    encoder_feature_dim: int = 80
     augmentation: bool = True
     random_shift_pad: int = 4
+    pixel_observation:  bool = True  # Use pixel observations
     
 
 @dataclass

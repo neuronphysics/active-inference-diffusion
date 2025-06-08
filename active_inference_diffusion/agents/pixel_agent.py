@@ -12,7 +12,7 @@ from typing import Dict, Tuple, Optional, Any
 
 from .base_agent import BaseActiveInferenceAgent
 from ..core.active_inference import DiffusionActiveInference
-from ..encoder.visual_encoders import RandomShiftAugmentation
+from ..encoder.visual_encoders import RandomShiftAugmentation, DrQV2Encoder
 from ..encoder.state_encoders import EncoderFactory
 from ..utils.buffers import ReplayBuffer
 from ..configs.config import (
@@ -74,16 +74,20 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
         # Update configuration
         self.config.action_dim = self.action_dim
         # Set observation dimension to encoder output dimension
-        self.config.observation_dim = self.pixel_config.encoder_feature_dim
+        if self.pixel_config.pixel_observation:
+            self.config.observation_dim = self.config.latent_dim
+        else:
+            self.config.observation_dim = self.obs_space[0]
         
     def _build_models(self):
         """Build visual encoding and diffusion active inference models"""
         # Visual encoder
-        self.encoder = EncoderFactory.create_encoder(
-            encoder_type=self.pixel_config.encoder_type,
+        self.encoder = DrQV2Encoder(
             obs_shape=self.obs_shape,
-            feature_dim=self.pixel_config.encoder_feature_dim,
-            frame_stack=self.pixel_config.frame_stack
+            feature_dim=self.config.latent_dim,
+            frame_stack=self.pixel_config.frame_stack,
+            num_layers=4,
+            num_filters=32,
         )
         
         # Augmentation module
@@ -94,23 +98,17 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
         # Core diffusion active inference
         # Uses encoder output dimension as observation dimension
         self.active_inference = DiffusionActiveInference(
-            observation_dim=self.pixel_config.encoder_feature_dim,
+            observation_dim=self.config.observation_dim,
             action_dim=self.action_dim,
             latent_dim=self.config.latent_dim,
-            config=self.config
+            config=self.config,
+            pixel_shape=self.obs_shape if self.pixel_config.pixel_observation else None
         )
         
-        # Representation predictor for contrastive learning
-        self.representation_predictor = nn.Sequential(
-            nn.Linear(self.config.latent_dim, self.config.hidden_dim),
-            nn.ReLU(),
-            nn.Linear(self.config.hidden_dim, self.pixel_config.encoder_feature_dim)
-        )
-        
+
         # Move all components to device
         self.encoder = self.encoder.to(self.device)
         self.active_inference = self.active_inference.to(self.device)
-        self.representation_predictor = self.representation_predictor.to(self.device)
         
     def act(
         self,
@@ -127,7 +125,12 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
         
         # Encode to feature space
         with torch.no_grad():
+            if hasattr(self, 'encoder'):
+                self.encoder = self.encoder.to(self.device)
+
             encoded_obs = self.encode_observation(obs_tensor)
+            if encoded_obs.dim() == 1:
+               encoded_obs = encoded_obs.unsqueeze(0)
             
             # Use diffusion active inference with encoded features
             action_tensor, info = self.active_inference.act(
@@ -137,9 +140,19 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
             
         # Convert to numpy
         action = action_tensor.cpu().numpy()
-        if action.ndim > 1:
-            action = action.squeeze(0)
-            
+        # Handle different action shapes
+        if action.ndim == 0:  # Scalar
+            action = np.array([action])
+        elif action.ndim == 2 and action.shape[0] == 1:  # [1, action_dim]
+            action = action[0]
+        elif action.ndim == 1:  # Already correct shape
+            pass
+        else:
+            # Unexpected shape - try to flatten to 1D
+            action = action.flatten()
+        if hasattr(self, 'action_dim') and len(action) != self.action_dim:
+            print(f"Warning: action shape {action.shape} doesn't match expected {self.action_dim}")
+         
         # Add exploration noise if training
         if not deterministic and self.training and self.exploration_noise > 0:
             noise = np.random.normal(0, self.exploration_noise, size=action.shape)
@@ -375,7 +388,7 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
         # 7. Train dynamics model
         self.dynamics_optimizer.zero_grad()
         
-        predicted_next_latents = self.active_inference.predict_next_latent(latents, actions)
+        predicted_next_latents, predicted_next_logvar = self.active_inference.predict_next_latent(latents, actions)
         dynamics_loss = F.mse_loss(predicted_next_latents, next_latents)
         dynamics_loss.backward()
         
@@ -403,10 +416,9 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
         """
         # Predict next visual features from current latent and action
         predicted_next_latent = self.active_inference.predict_next_latent(latents, actions)
-        predicted_features = self.representation_predictor(predicted_next_latent)
         
         # Normalize for contrastive loss
-        pred_norm = F.normalize(predicted_features, dim=-1)
+        pred_norm = F.normalize(predicted_next_latent, dim=-1)
         target_norm = F.normalize(next_obs, dim=-1)
         
         # InfoNCE loss
@@ -421,8 +433,8 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
         self.score_optimizer = torch.optim.AdamW(
             list(self.active_inference.latent_score_network.parameters()) +
             list(self.active_inference.latent_diffusion.parameters()) +
-            list(self.encoder.parameters()) +
-            list(self.representation_predictor.parameters()),
+            list(self.encoder.parameters())+
+            list(self.active_inference.feature_decoder.parameters()),
             lr=self.config.learning_rate,
             weight_decay=1e-5
         )

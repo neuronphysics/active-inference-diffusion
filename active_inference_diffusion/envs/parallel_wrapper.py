@@ -80,15 +80,32 @@ def env_worker(remote, parent_remote, env_fn_wrapper, agent_state_dict, agent_cl
                 agent.active_inference.load_state_dict(state_dict['active_inference_state'])
                 if hasattr(agent, 'encoder'):
                     agent.encoder.load_state_dict(state_dict['encoder_state'])
-            
+                    agent.encoder.to('cpu')
+                    if hasattr(agent, "representation_predictor"):
+                        agent.representation_predictor.to('cpu')
             # Ensure agent is on CPU and in eval mode
             agent.device = torch.device('cpu')
             agent.active_inference = agent.active_inference.to('cpu')
+            if hasattr(agent, 'encoder'):
+                agent.encoder = agent.encoder.to('cpu')
             agent.active_inference.eval()
             
         except Exception as e:
             print(f"Failed to create agent in worker: {e}")
-            agent = None
+            import traceback
+            traceback.print_exc()
+            # Send error in expected format
+            if cmd == 'act':
+                # Send random action with error info
+                action = env.action_space.sample()
+                remote.send((action, {'error': str(e)}))
+            elif cmd == 'step':
+                # Send dummy step result
+                obs, _ = env.reset()
+                remote.send((obs, 0.0, True, {'error': str(e)}))
+            else:
+                remote.send(('error', str(e)))
+
     
     while True:
         try:
