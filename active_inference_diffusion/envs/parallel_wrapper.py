@@ -289,8 +289,20 @@ class ParallelDataCollector:
             
             # Collect results
             for i, remote in enumerate(self.remotes):
-                next_obs, reward, done, info = remote.recv()
-                
+                try:
+                    result = remote.recv()
+                    if isinstance(result, tuple) and len(result) == 4:
+                        next_obs, reward, done, info = result
+                    else:
+                        # Handle error case
+                        print(f"Unexpected result format: {result}")
+                        # Reset environment on error
+                        remote.send(('reset', None))
+                        next_obs, info = remote.recv()
+                        reward = 0
+                        done = True
+                except Exception as e:
+                    raise ValueError(f"Error receiving step result from environment {i}: {e}")
                 # Add to replay buffer
                 replay_buffer.add(
                     self.observations[i],

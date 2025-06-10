@@ -1,12 +1,12 @@
 """
 Active Inference with Diffusion-Generated Latent Spaces
 """
-
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, Tuple, Optional, Union
 from ..configs import ActiveInferenceConfig
 from ..encoder.visual_encoders import ConvDecoder
 from .diffusion import LatentDiffusionProcess
@@ -14,7 +14,7 @@ from ..models.score_networks import LatentScoreNetwork
 from ..models.policy_networks import DiffusionConditionedPolicy
 from ..models.value_networks import ValueNetwork
 from ..models.dynamics_models import LatentDynamicsModel
-
+from ..utils.util import SpatialAttentionAggregator
 class DiffusionActiveInference(nn.Module):
     """
     Core Active Inference implementation with diffusion-generated latents
@@ -41,7 +41,8 @@ class DiffusionActiveInference(nn.Module):
         self.config = config
         self.pixel_shape = pixel_shape 
         self.is_pixel_observation = config.pixel_observation
-        self.epistemic_dropout_rate = 0.2 
+        self.epistemic_dropout_rate = 0.2
+        self.device = config.device 
         if self.is_pixel_observation and pixel_shape is not None:
             self.raw_observation_shape = pixel_shape
         else:
@@ -49,7 +50,7 @@ class DiffusionActiveInference(nn.Module):
             
         # Initialize components
         self._build_models()
-        
+        self.to(self.device)
         # Current belief state (diffusion-generated)
         self.current_latent = None
         self.latent_trajectory = []
@@ -59,12 +60,13 @@ class DiffusionActiveInference(nn.Module):
    
         # Latent diffusion process
         self.latent_diffusion = LatentDiffusionProcess(
-                                                       self.config.diffusion, 
-                                                       latent_dim=self.latent_dim)
+            self.config.diffusion,
+            latent_dim=self.latent_dim
+        )
         # Add reward preference components
-        self.register_buffer('reward_mean', torch.tensor(0.0))
-        self.register_buffer('reward_var', torch.tensor(1.0))
-        self.register_buffer('preference_temperature', torch.tensor(self.config.preference_temperature))
+        self.register_buffer('reward_mean', torch.tensor(0.0).to(self.device))
+        self.register_buffer('reward_var', torch.tensor(1.0).to(self.device))
+        self.register_buffer('preference_temperature', torch.tensor(self.config.preference_temperature).to(self.device))
     
 
         # Score network for latent generation
@@ -105,7 +107,7 @@ class DiffusionActiveInference(nn.Module):
         
         # Observation decoder (latent -> observation prediction)
         if not self.is_pixel_observation:
-           self.observation_decoder = nn.ModuleList([
+            self.observation_decoder = nn.ModuleList([
                 nn.Sequential(
                 nn.Linear(self.latent_dim, self.config.hidden_dim * 2),
                 nn.LayerNorm(self.config.hidden_dim * 2),
@@ -126,7 +128,7 @@ class DiffusionActiveInference(nn.Module):
                ),
                nn.Linear(self.config.hidden_dim, self.observation_dim)
                ])
-            
+            observation_shape = self.observation_dim # For non-pixel observations
         else:
             self.observation_decoder = ConvDecoder(
                 latent_dim=self.latent_dim,
@@ -134,7 +136,6 @@ class DiffusionActiveInference(nn.Module):
                 img_channels=self.pixel_shape[0],
                 hidden_dim=self.config.hidden_dim,
                 spatial_size=21,
-                num_conv_layers=2  # More layers to reach 84x84
                 )
             # Also add a feature decoder for reconstructing encoded features
             self.feature_decoder = nn.Sequential(
@@ -144,6 +145,15 @@ class DiffusionActiveInference(nn.Module):
                 nn.Dropout(self.epistemic_dropout_rate),
                 nn.Linear(self.config.hidden_dim, self.latent_dim),  # Decode to feature space
                 nn.Tanh()
+                )
+            observation_shape = self.pixel_shape  # For pixel observations
+        self.epistemic_estimator = FunctionSpaceEpistemicEstimator(
+            decoder=self.observation_decoder,
+            latent_dim=self.latent_dim,
+            observation_shape= observation_shape,
+            hidden_dim=self.config.hidden_dim,
+            is_pixel_observation= self.is_pixel_observation,
+            device=self.device
             )
 
         #initialize a reward predictor
@@ -164,12 +174,14 @@ class DiffusionActiveInference(nn.Module):
             decode_to_pixels: If True and using pixel observations, decode to raw pixels.
                             If False, decode to encoded feature space.
         """
+        latent = latent.to(self.device)
         if self.is_pixel_observation:
             if decode_to_pixels:
                 # Decode to pixel space
                 return self.observation_decoder(latent)
             else:
                 # Decode to feature space (for reconstruction loss)
+                self.feature_decoder = self.feature_decoder.to(self.device)
                 return self.feature_decoder(latent)
         else:
             # For non-pixel observations, use fully connected decoder
@@ -189,6 +201,7 @@ class DiffusionActiveInference(nn.Module):
         """
         Use existing reward predictor to get reward distribution from latent
         """
+        latent = latent.to(self.device)
         reward_params = self.reward_predictor(latent)
         reward_mean = reward_params[:, 0]
         reward_std = torch.exp(torch.clamp(reward_params[:, 1], min=-5, max=2))
@@ -204,6 +217,7 @@ class DiffusionActiveInference(nn.Module):
         Update belief using reverse diffusion process
         This is the core innovation - beliefs as diffusion-generated latents
         """
+        observation = observation.to(self.device)
         # Handle different input shapes
         if observation.dim() == 1:
             observation = observation.unsqueeze(0)
@@ -264,6 +278,7 @@ class DiffusionActiveInference(nn.Module):
         G(π) = Epistemic + Pragmatic + Consistency terms
         G(π) = E_z~p_θ(z) E_q(s'|s,π) [D_KL[q(o'|s')||p(o')] - log p_φ(π|z)]
         """
+        latent = latent.to(self.device)
         device = latent.device
         batch_size = latent.shape[0]
         
@@ -299,7 +314,7 @@ class DiffusionActiveInference(nn.Module):
                 consistency = -policy_dist.entropy().sum(dim=-1)
 
     
-                epistemic= self.compute_epistemic_value(
+                epistemic, epistemic_metrics= self.compute_epistemic_value(
                     next_latent_mean,
                     next_latent_logvar,
                     num_samples=num_ambiguity_samples
@@ -329,7 +344,8 @@ class DiffusionActiveInference(nn.Module):
             'pragmatic_mean': torch.stack(pragmatic_values).mean(),
             'consistency_mean': torch.stack(latent_consistency).mean(),
             'num_trajectories': num_trajectories,
-            'horizon': horizon
+            'horizon': horizon,
+            **epistemic_metrics
         }
         
         return total_efe, info
@@ -338,79 +354,50 @@ class DiffusionActiveInference(nn.Module):
         self,   
         next_latent_mean: torch.Tensor,
         next_latent_logvar: torch.Tensor,
-        num_samples: int = 10
+        num_samples: int = 5
     ) -> torch.Tensor:
         # Compute epistemic value: H(o|s,π) - H(o|s,θ,π)
         # Epistemic value (ambiguity - observation uncertainty)
         #- H[p(o|s,π)] is entropy marginalizing over model parameters (using dropout)
         #- H[p(o|s,θ,π)] is entropy for a fixed set of parameters
-
-        batch_size = next_latent_mean.shape[0]
-        device = next_latent_mean.device
-        
-                
-        # Enable dropout for sampling
-        original_mode = self.training
-        entropy_obs_given_state_policy= torch.zeros(batch_size, device=device)
-        self.train()
-        observation=[]
-        #  Term 1: H[p(o|s,π)] - entropy marginalizing over model parameters
-        for _ in range(num_samples):
-            # Different parameters each forward pass
-            next_latent= self.reparameterize(next_latent_mean, next_latent_logvar)
-            if self.is_pixel_observation:
-                # Decode to feature space for epistemic computation
-                po_temp = self.decode_observation(next_latent, decode_to_pixels=True)
-                
-            else:
-                po_temp = self.decode_observation(next_latent)
-            
-            observation.append(po_temp)
-        obs_dropout = torch.stack(observation, dim=0)  # Shape: (num_samples, batch_size, obs_dim)
-        if self.config.pixel_observation:
-            
-            # Compute entropy (assuming Bernoulli distribution)
-            # Shape: (batch_size, obs_dim)
-            p = torch.clamp(obs_dropout, 1e-8, 1-1e-8)
-            entropy = - (p * torch.log(p) + (1-p) * torch.log(1-p))
-            entropy_obs_given_state_policy = entropy.reshape(batch_size, -1).sum(dim=-1)  # Sum over pixel dimensions
-        else:
-            var_obs = obs_dropout.var( dim=0)+ 1e-8  # Add small constant for numerical stability
-    
-            # Differential entropy of Gaussian: 0.5 * log(2πe * σ²)
-            entropy = 0.5 * torch.log(2 * np.pi * np.e * var_obs + 1e-8)
-    
-            entropy_obs_given_state_policy=entropy.sum(dim=-1) 
-        entropy_obs_given_state_theta_pi = torch.zeros(batch_size, device=device)    
-        # Term 2: H[p(o|s,θ,π)] - entropy for fixed parameters
-        self.eval()
-        observation = []
+        next_latent_mean = next_latent_mean.to(self.device)
+        next_latent_logvar = next_latent_logvar.to(self.device)
         with torch.no_grad():
-            for _ in range(num_samples):
-                # Sample from state distribution
-                state_sample = self.reparameterize(next_latent_mean, next_latent_logvar)
-                if self.is_pixel_observation:
-                    po_temp = self.decode_observation(state_sample, decode_to_pixels=True)
-                else:
-                    po_temp = self.decode_observation(state_sample)
-                observation.append(po_temp)
-            po_temp = torch.stack(observation, dim=0)  # Shape: (num_samples, batch_size, obs_dim)
-            if self.config.pixel_observation:
-                # Shape: (batch_size, obs_dim)
-                p = torch.clamp(po_temp, 1e-8, 1-1e-8)
-                entropy = - (p * torch.log(p) + (1-p) * torch.log(1-p))
-                entropy_obs_given_state_theta_pi= entropy.reshape(batch_size, -1).sum(dim=-1)
-            else:
-                state_var = torch.var(po_temp, dim=0)
-                # Differential entropy of Gaussian: 0.5 * log(2πe * σ²)
-                entropy = 0.5 * torch.log(2 * np.pi * np.e * state_var + 1e-8)
-                entropy_obs_given_state_theta_pi= entropy.sum(dim=-1) 
-            
-        self.train(original_mode)  # Restore original training mode
-        # Epistemic value: H(o|s,π) - H(o|s,θ,π)
-        epistemic_value=entropy_obs_given_state_policy - entropy_obs_given_state_theta_pi
-        epistemic_value = torch.clamp(epistemic_value, min=0.0)  # Ensure non-negative
-        return epistemic_value
+            epistemic_value, metrics = self.epistemic_estimator(
+                next_latent_mean, 
+                next_latent_logvar, 
+                num_samples
+            )
+        
+        
+        return epistemic_value, metrics
+
+    def train_epistemic_estimator(
+        self,
+        latents: torch.Tensor,
+        actions: torch.Tensor,
+        next_latents: torch.Tensor
+    ) -> float:
+        """Train MINE estimator separately"""
+        latents = latents.to(self.device)
+        actions = actions.to(self.device)
+        # Predict next latent distribution
+        next_mean, next_logvar = self.predict_next_latent(latents, actions)
+
+        # Compute MINE loss (negative MI for minimization)
+        mi_estimate, metrics = self.epistemic_estimator(next_mean, next_logvar)
+        loss = -mi_estimate.mean()
+    
+        # Optimize
+        self.epistemic_optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            self.epistemic_estimator.parameters(),
+            self.config.gradient_clip
+        )
+        self.epistemic_optimizer.step()
+
+        return mi_estimate.mean().item(), metrics
 
     def reparameterize(self, mean: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         std = torch.exp(0.5 * logvar)
@@ -424,9 +411,11 @@ class DiffusionActiveInference(nn.Module):
         action: torch.Tensor
     ) -> torch.Tensor:
         """Predict next latent state using learned dynamics"""
+        latent = latent.to(self.device)
+        action = action.to(self.device)
         delta = self.latent_dynamics(latent, action)
         next_mean= latent + delta  # Residual connection
-        next_logvar = torch.full_like(next_mean, np.log(0.1))
+        next_logvar = torch.full_like(next_mean, np.log(0.1)).to(self.device)  
         return next_mean, next_logvar
         
     def _compute_latent_kl(
@@ -450,6 +439,7 @@ class DiffusionActiveInference(nn.Module):
         """
         Select action using diffusion-generated latent active inference
         """
+        observation = observation.to(self.device)
         if observation.dim() == 1:
             observation = observation.unsqueeze(0)
 
@@ -476,6 +466,12 @@ class DiffusionActiveInference(nn.Module):
         # Ensure action has proper shape
         if action.dim() > 2:
             action = action.squeeze()
+        elif action.dim() == 2 and action.shape[0] == 1:
+            action = action.squeeze(0)
+        elif action.dim() == 0:
+            # Handle scalar actions
+            action = action.unsqueeze(0)
+
         
         # Compile information
         info = {
@@ -501,8 +497,10 @@ class DiffusionActiveInference(nn.Module):
         
         L = E_q(z|o,π)[log p(o|z)] - D_KL[q(z|o,π)||p_θ(z)] + R_diffusion(θ)
         """
+        observations = observations.to(self.device)
+        rewards = rewards.to(self.device)
         batch_size = observations.shape[0]
-        device = observations.device
+        device = self.device
         
         # Generate latents if not provided
         if latents is None:
@@ -533,7 +531,7 @@ class DiffusionActiveInference(nn.Module):
             t = torch.rand(batch_size, device=device)
 
         
-        noise = torch.randn_like(latents)
+        noise = torch.randn_like(latents, device=device)
     
         noisy_latents, true_noise, sample_info = self.latent_diffusion.continuous_q_sample(latents, t, noise)
         
@@ -664,8 +662,7 @@ class DiffusionActiveInference(nn.Module):
         observations: torch.Tensor
     ) -> torch.Tensor:
         """Gradient penalty for stable training"""
-        noisy_latents.requires_grad_(True)
-    
+        noisy_latents = noisy_latents.detach().requires_grad_(True)    
         score = self.latent_score_network(noisy_latents, t, observations)
     
         gradients = torch.autograd.grad(
@@ -721,7 +718,33 @@ class DiffusionActiveInference(nn.Module):
             current_weight = self.time_importance_weights[time_bin].item()
             new_weight = 0.99 * current_weight + 0.01 * sample_loss
             self.time_importance_weights[time_bin] = new_weight
-
+    def to(self, device):
+        """Override to ensure all components move to the specified device"""
+        super().to(device)
+        self.device = device
+    
+        # Ensure all sub-models are on the correct device
+        if hasattr(self, 'feature_decoder'):
+            self.feature_decoder = self.feature_decoder.to(device)
+        if hasattr(self, 'observation_decoder'):
+            if isinstance(self.observation_decoder, nn.ModuleList):
+                for i in range(len(self.observation_decoder)):
+                    self.observation_decoder[i] = self.observation_decoder[i].to(device)
+            else:
+                self.observation_decoder = self.observation_decoder.to(device)
+    
+        # Move all other components
+        for name, module in self.named_children():
+            if module is not None:
+                module.to(device)
+            
+        # Move buffers
+        self.reward_mean = self.reward_mean.to(device)
+        self.reward_var = self.reward_var.to(device)
+        self.preference_temperature = self.preference_temperature.to(device)
+    
+        return self
+    
 def extract(a: torch.Tensor, t: torch.Tensor, x_shape: Tuple) -> torch.Tensor:
     """Extract coefficients helper"""
     batch_size = t.shape[0]
@@ -763,3 +786,236 @@ class EMAModel:
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 param.data = self.backup[name]
+
+class EMALoss(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, running_ema):
+        ctx.save_for_backward(input, running_ema)
+        input_log_sum_exp = input.exp().mean().log()
+        return input_log_sum_exp
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, running_mean = ctx.saved_tensors
+        grad = grad_output * input.exp().detach() / (running_mean + 1e-6) / input.shape[0]
+        return grad, None
+
+def ema_loss(x, running_mean, alpha=0.01):
+    """Exponential moving average loss for stable MINE training"""
+    t_exp = torch.exp(torch.logsumexp(x, 0) - math.log(x.shape[0])).detach()
+    if running_mean == 0:
+        running_mean = t_exp
+    else:
+        running_mean = alpha * t_exp + (1.0 - alpha) * running_mean.item()
+    t_log = EMALoss.apply(x, running_mean)
+    return t_log, running_mean
+
+
+class FunctionSpaceEpistemicEstimator(nn.Module):
+    """
+    Computes epistemic value I(o; θ | z) via function-space features
+    using neural tangent kernel approximation and MINE estimation
+    """
+    
+    def __init__(
+        self, 
+        decoder: nn.Module,
+        latent_dim: int,
+        observation_shape: Union[int,Tuple[int, int, int]],
+        hidden_dim: int = 256,
+        is_pixel_observation: bool = True,
+        device: Union[str, torch.device] = 'cuda'
+    ):
+        super().__init__()
+        self.decoder = decoder
+        self.latent_dim = latent_dim
+        self.is_pixel= is_pixel_observation
+        self.device = torch.device(device) if isinstance(device, str) else device
+        
+        # Jacobian approximation parameters
+        self.ntk_samples = 5
+        self.perturbation_scale = nn.Parameter(torch.tensor(0.1)).to(self.device)
+        
+        if self.is_pixel:
+            self.pixel_shape = observation_shape
+            # Pixel-aware MINE architecture using ConvolutionalStatisticsNetwork pattern
+            self.pixel_processor = nn.Sequential(
+                nn.Conv2d(self.pixel_shape[0], 32, kernel_size=5, stride=2, padding=2),
+                nn.ReLU(),
+                nn.Conv2d(32, 64, kernel_size=5, stride=2, padding=2),
+                nn.ReLU(),
+                nn.Conv2d(64, 128, kernel_size=5, stride=2, padding=2),
+                nn.ReLU(),
+            )
+            # Spatial attention aggregator instead of average pooling
+            self.spatial_aggregator = SpatialAttentionAggregator(
+                feature_dim=128,
+                num_heads=8,
+                spatial_dim=21  # After 3 stride-2 convolutions from 84x84
+            )
+            # Jacobian feature projection
+            jacobian_dim = hidden_dim * self.ntk_samples  # 128 channels, 2 spatial dimensions (H, W)
+        else:
+            self.state_dim = observation_shape
+            self.feature_extractor = nn.Sequential(
+                    nn.Linear(self.state_dim, 128),
+                    nn.ReLU(),
+                    nn.Linear(128, 256),
+                    nn.ReLU(),
+                    nn.Linear(256, 128)
+            )
+            jacobian_dim = 128 * self.ntk_samples
+
+        self.jacobian_projector = nn.Sequential(
+            nn.Linear(jacobian_dim, 512),
+            nn.LayerNorm(512),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(512, 256)
+        )
+        
+        # Latent feature processor
+        self.latent_processor = nn.Sequential(
+            nn.Linear(latent_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128)
+        )
+        
+        # MINE statistics network
+        self.mine_network = nn.Sequential(
+            nn.Linear(hidden_dim + 128, 512),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(512, 1)
+        )
+        
+        # EMA for stable MINE training
+        self.register_buffer('running_mean', torch.tensor(0.0))
+        self.alpha = 0.01
+        self.to(self.device)
+
+    def compute_jacobian_features(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        Approximates function-space features via finite differences
+        in the neural tangent kernel regime
+        """
+        z= z.to(self.device)
+        batch_size = z.shape[0]
+        jacobian_samples = []
+        # Base decoding
+        with torch.no_grad():
+            decoder_training = self.decoder.training
+            self.decoder.eval()  
+            f_z = self.decoder(z)  # (B, 3, 84, 84)
+            if self.is_pixel and f_z.dim() == 4:  # (B, C, H, W)
+                f_z_flat = f_z.view(batch_size, -1)
+            else:
+                f_z_flat = f_z    
+        epsilon = self.perturbation_scale    
+        # Compute directional derivatives
+        for _ in range(self.ntk_samples):
+            # Sample perturbation direction
+            delta = F.normalize(torch.randn_like(z), dim=-1) * epsilon
+            
+            # Compute finite difference
+            with torch.no_grad():
+                f_z_perturbed = self.decoder(z + delta)
+            
+                if self.is_pixel and f_z_perturbed.dim() == 4:
+                    f_z_perturbed_flat = f_z_perturbed.view(batch_size, -1)
+                else:
+                    f_z_perturbed_flat = f_z_perturbed
+                    
+            # Directional derivative
+            diff = (f_z_perturbed_flat - f_z_flat) / epsilon
+            
+            # Process through pixel encoder
+            if self.is_pixel:
+                # Process pixel differences
+                diff_img = diff.view(batch_size, *self.pixel_shape)
+                diff_features = self.pixel_processor(diff_img)
+                spatial_features, _ = self.spatial_aggregator(diff_features)
+                jacobian_samples.append(spatial_features.view(batch_size, -1))
+            else:
+                # Process state differences
+                diff_features = self.feature_extractor(diff)
+                jacobian_samples.append(diff_features)
+
+        if decoder_training:
+            self.decoder.train()
+        # Average Jacobian features
+        jacobian_features = torch.cat(jacobian_samples, dim=1)
+        return self.jacobian_projector(jacobian_features)
+    
+    def forward(
+        self, 
+        next_latent_mean: torch.Tensor,
+        next_latent_logvar: torch.Tensor,
+        num_samples: int = 5
+    ) -> torch.Tensor:
+        """
+        Estimates epistemic value I(o; θ | z) using MINE
+        """
+        batch_size = next_latent_mean.shape[0]
+        next_latent_mean = next_latent_mean.to(self.device)
+        next_latent_logvar = next_latent_logvar.to(self.device)
+        
+        # Sample latent states
+        z_samples = []
+        for _ in range(num_samples):
+            z = next_latent_mean + torch.randn_like(next_latent_mean).to(self.device) * torch.exp(0.5 * next_latent_logvar)
+            z_samples.append(z)
+        
+        z_all = torch.cat(z_samples, dim=0)  # (B*num_samples, latent_dim)
+        
+        # Compute Jacobian features (function-space representation)
+        jacobian_features = self.compute_jacobian_features(z_all)
+        
+        # Process latent features
+        latent_features = self.latent_processor(z_all)
+        
+        # Combine features for MINE
+        combined_features = torch.cat([jacobian_features, latent_features], dim=1)
+        
+        # MINE estimation with proper permutation
+        t_joint = self.mine_network(combined_features)
+        
+        # Create marginal by permuting within batch
+        jacobian_marginal_list = []
+        for i in range(num_samples):
+            start_idx = i * batch_size
+            end_idx = (i + 1) * batch_size
+            batch_features = jacobian_features[start_idx:end_idx]
+            
+            # Shuffle within this batch
+            perm = torch.randperm(batch_size, device=self.device)
+            jacobian_marginal_list.append(batch_features[perm])
+            
+        jacobian_marginal = torch.cat(jacobian_marginal_list, dim=0)
+        
+        # Marginal features
+        combined_marginal = torch.cat([jacobian_marginal, latent_features], dim=1)
+        t_marginal = self.mine_network(combined_marginal)
+        
+        # MINE lower bound with EMA
+        t_marginal_logsumexp, self.running_mean = ema_loss(
+            t_marginal, self.running_mean, self.alpha
+        )
+        
+        mi_lower_bound = t_joint.mean() - t_marginal_logsumexp
+        
+        # Average over samples and ensure proper shape
+        epistemic_value = mi_lower_bound.expand(batch_size)
+        
+        # Prepare metrics for logging
+        metrics = {
+            'epistemic/mi_estimate': mi_lower_bound.item(),
+            'epistemic/joint_term': t_joint.mean().item(),
+            'epistemic/marginal_term': t_marginal_logsumexp.item(),
+            'epistemic/running_mean': self.running_mean.item()
+        }
+    
+        return torch.clamp(epistemic_value, min=0.0), metrics

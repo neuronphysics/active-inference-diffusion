@@ -373,7 +373,7 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
                     lambda_=0.95,  # TODO: can be added to config
                     n_steps=5
                     )
-            
+    
         value_loss = F.huber_loss(values, targets)
         value_loss.backward()
         
@@ -384,7 +384,14 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
         self.value_optimizer.step()
         
         metrics['value_loss'] = value_loss.item()
-        
+        # Train epistemic estimator separately
+        if self.total_steps % 5 == 0:  # Train less frequently for stability
+            epistemic_mi, epistemic_metrics = self.active_inference.train_epistemic_estimator(
+                latents, actions, next_latents
+            )
+            metrics['epistemic_mi'] = epistemic_mi
+            metrics.update(epistemic_metrics)
+
         # 7. Train dynamics model
         self.dynamics_optimizer.zero_grad()
         
@@ -399,6 +406,7 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
         self.dynamics_optimizer.step()
         
         metrics['dynamics_loss'] = dynamics_loss.item()
+        self.total_steps += 1
         
         return metrics
         

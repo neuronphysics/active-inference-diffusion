@@ -244,8 +244,8 @@ class ConvDecoder(nn.Module):
         img_channels: int = 3,
         hidden_dim: int = 256,
         spatial_size: int = 21,  # For 84x84 output
-        num_conv_layers: int = 2,  # Not used but kept for compatibility
-        use_spectral_norm: bool = True
+        use_spectral_norm: bool = True,
+        device: Optional[torch.device] = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ):
         super().__init__()
         
@@ -253,6 +253,7 @@ class ConvDecoder(nn.Module):
         self.output_dim = output_dim
         self.spatial_size = spatial_size
         self.img_channels = img_channels
+        self.device = device
         
         # Initial projection with careful initialization
         self.latent_proj = nn.Sequential(
@@ -292,8 +293,8 @@ class ConvDecoder(nn.Module):
         self.decoder_blocks.append(
             DecoderBlock(
                 in_channels=hidden_dim // 2,
-                out_channels=hidden_dim // 2,
-                upsample=False,
+                out_channels=hidden_dim // 4,
+                upsample=True,
                 use_spectral_norm=use_spectral_norm
             )
         )
@@ -302,21 +303,13 @@ class ConvDecoder(nn.Module):
         self.decoder_blocks.append(
             DecoderBlock(
                 in_channels=hidden_dim // 2,
-                out_channels=hidden_dim // 4,
+                out_channels=hidden_dim // 8,
                 upsample=True,
                 use_spectral_norm=use_spectral_norm
             )
         )
         
-        # Block 5: Final refinement at 84x84
-        self.decoder_blocks.append(
-            DecoderBlock(
-                in_channels=hidden_dim // 4,
-                out_channels=hidden_dim // 8,
-                upsample=False,
-                use_spectral_norm=use_spectral_norm
-            )
-        )
+
         
         # Output projection with multiple conv layers for refinement
         self.output_proj = nn.Sequential(
@@ -329,6 +322,8 @@ class ConvDecoder(nn.Module):
             nn.Conv2d(32, img_channels, kernel_size=3, padding=1),
             nn.Sigmoid()  # Output in [0, 1]
         )
+        self.to(self.device)
+        
         
         # Initialize weights
         self._initialize_weights()
@@ -355,6 +350,7 @@ class ConvDecoder(nn.Module):
         3. Progressively upsample and refine
         4. Final multi-layer output projection
         """
+        latent = latent.to(self.device)
         batch_size = latent.shape[0]
         
         # Project latent to spatial representation

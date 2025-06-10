@@ -4,6 +4,75 @@ import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
 from typing import Optional, Union
+class SpatialAttentionAggregator(nn.Module):
+    """
+    Multi-head attention for spatially-aware epistemic feature aggregation
+    Preserves and weights spatial information based on uncertainty relevance
+    """
+    
+    def __init__(self, feature_dim: int = 128, num_heads: int = 8, spatial_dim: int = 21):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.num_heads = num_heads
+        self.head_dim = feature_dim // num_heads
+        
+        # Positional encoding for spatial awareness
+        self.pos_encoding = nn.Parameter(
+            torch.randn(1, spatial_dim * spatial_dim, feature_dim) * 0.02
+        )
+        
+        # Multi-head attention
+        self.attention = nn.MultiheadAttention(
+            embed_dim=feature_dim,
+            num_heads=num_heads,
+            dropout=0.1,
+            batch_first=True
+        )
+        
+        # Learnable query tokens for epistemic-relevant features
+        self.epistemic_queries = nn.Parameter(
+            torch.randn(1, 16, feature_dim) * 0.02  # 16 query tokens
+        )
+        
+        # Output projection
+        self.output_proj = nn.Sequential(
+            nn.Linear(16 * feature_dim, 512),
+            nn.LayerNorm(512),
+            nn.GELU(),
+            nn.Linear(512, 256)
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, C, H, W) feature maps
+        Returns:
+            (B, 256) aggregated features
+        """
+        B, C, H, W = x.shape
+        
+        # Reshape to sequence format
+        x = x.view(B, C, H * W).permute(0, 2, 1)  # (B, H*W, C)
+        
+        # Add positional encoding
+        x = x + self.pos_encoding[:, :H*W, :]
+        
+        # Expand queries for batch
+        queries = self.epistemic_queries.expand(B, -1, -1)
+        
+        # Apply multi-head attention
+        attended, attention_weights = self.attention(
+            query=queries,
+            key=x,
+            value=x,
+            need_weights=True
+        )
+        
+        # Flatten and project
+        attended_flat = attended.reshape(B, -1)
+        output = self.output_proj(attended_flat)
+        
+        return output, attention_weights
 def visualize_reconstruction(
     agent,  # Type annotation removed to avoid circular import
     observations: torch.Tensor,

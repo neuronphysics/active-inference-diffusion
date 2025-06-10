@@ -7,7 +7,7 @@ from .training import (
     create_video,
     plot_training_curves
 )
-from .util import visualize_reconstruction
+from .util import visualize_reconstruction, SpatialAttentionAggregator
 __all__ = [
     "ReplayBuffer",
     "Logger",
@@ -17,4 +17,5 @@ __all__ = [
     "create_video",
     "plot_training_curves",
     "visualize_reconstruction",
+    "SpatialAttentionAggregator"
 ]

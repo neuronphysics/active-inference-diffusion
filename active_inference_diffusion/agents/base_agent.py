@@ -88,6 +88,7 @@ class BaseActiveInferenceAgent(ABC):
         self.episode_count = 0
         self.exploration_noise = training_config.exploration_noise
         self.reward_normalizer = RunningMeanStd(shape=())
+        
     @abstractmethod
     def _setup_dimensions(self):
         """Setup state/action dimensions"""
@@ -129,6 +130,13 @@ class BaseActiveInferenceAgent(ABC):
             list(self.active_inference.reward_predictor.parameters()),
             lr=self.config.learning_rate
         )
+        #Add epistemic optimizer
+        self.epistemic_optimizer = torch.optim.Adam(
+            self.active_inference.epistemic_estimator.parameters(),
+            lr=self.config.learning_rate*0.1,
+            weight_decay=1e-5
+        )
+        self.active_inference.epistemic_optimizer = self.epistemic_optimizer
         
     def act(
         self,

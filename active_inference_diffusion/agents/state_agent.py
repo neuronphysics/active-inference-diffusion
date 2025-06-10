@@ -175,7 +175,14 @@ class DiffusionStateAgent(BaseActiveInferenceAgent):
         self.value_optimizer.step()
         
         metrics['value_loss'] = value_loss.item()
-        
+        # Train epistemic estimator separately
+        if self.total_steps % 5 == 0:  # Train less frequently for stability
+            epistemic_mi, epistemic_metrics = self.active_inference.train_epistemic_estimator(
+                latents, actions, next_latents
+            )
+            metrics['epistemic_mi'] = epistemic_mi
+            metrics.update(epistemic_metrics)
+
         # 5. Train dynamics model
         self.dynamics_optimizer.zero_grad()
         
@@ -193,6 +200,7 @@ class DiffusionStateAgent(BaseActiveInferenceAgent):
         self.dynamics_optimizer.step()
         
         metrics['dynamics_loss'] = dynamics_loss.item()
+        self.total_steps += 1
         
         return metrics
         
