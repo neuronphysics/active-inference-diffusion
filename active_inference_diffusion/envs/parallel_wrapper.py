@@ -12,12 +12,18 @@ from typing import Optional, List, Dict, Any, Tuple, Union
 from pathlib import Path
 import cloudpickle
 import os
+import warnings
 
 from active_inference_diffusion.agents.pixel_agent import DiffusionPixelAgent
 from active_inference_diffusion.agents.state_agent import DiffusionStateAgent
 from active_inference_diffusion.utils.buffers import ReplayBuffer
 from active_inference_diffusion.configs.config import TrainingConfig
 
+# Ensure spawn method for CUDA compatibility
+try:
+    mp.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass
 
 class CloudpickleWrapper:
     """Serialization wrapper for multiprocessing"""
@@ -31,6 +37,44 @@ class CloudpickleWrapper:
         import pickle
         self.x = pickle.loads(ob)
 
+def move_to_cpu_recursive(module):
+    """
+    Recursively move all parameters, buffers, and submodules to CPU.
+    This ensures complete device migration for multiprocessing.
+    """
+    # First, move the module itself
+    module = module.cpu()
+    
+    # Update device attribute if it exists
+    if hasattr(module, 'device'):
+        module.device = torch.device('cpu')
+    
+    # Move all parameters
+    for param in module.parameters(recurse=False):
+        param.data = param.data.cpu()
+        if param.grad is not None:
+            param.grad.data = param.grad.data.cpu()
+    
+    # Move all buffers
+    for name, buffer in list(module.named_buffers(recurse=False)):
+        if buffer is not None:
+            # Re-register buffer on CPU
+            delattr(module, name)
+            module.register_buffer(name, buffer.cpu())
+    
+    # Handle special tensor attributes that might not be registered as buffers
+    for attr_name in dir(module):
+        if not attr_name.startswith('_'):
+            attr = getattr(module, attr_name)
+            if isinstance(attr, torch.Tensor):
+                setattr(module, attr_name, attr.cpu())
+    
+    # Recursively handle all child modules
+    for child_name, child_module in module.named_children():
+        setattr(module, child_name, move_to_cpu_recursive(child_module))
+    
+    return module
+
 
 def env_worker(remote, parent_remote, env_fn_wrapper, agent_state_dict, agent_class, agent_config, device):
     """
@@ -42,6 +86,7 @@ def env_worker(remote, parent_remote, env_fn_wrapper, agent_state_dict, agent_cl
     parent_remote.close()
     
     # Force CPU in worker process
+    os.environ['CUDA_VISIBLE_DEVICES'] = '' 
     device = 'cpu'
     torch.set_num_threads(1)  # Prevent thread explosion
     
@@ -50,24 +95,28 @@ def env_worker(remote, parent_remote, env_fn_wrapper, agent_state_dict, agent_cl
     
     # Create agent in this process (on CPU)
     agent = None
-    if agent_state_dict is not None:
+    
+    def create_agent():
+        """Helper to create agent with proper error handling"""
+        nonlocal agent
         try:
-            # Recreate the agent configuration
             if agent_class == "DiffusionStateAgent":
                 from active_inference_diffusion.agents.state_agent import DiffusionStateAgent
                 from active_inference_diffusion.configs.config import ActiveInferenceConfig, TrainingConfig
-                
-                # Create a minimal agent for inference only
+                agent_config['config'].device = 'cpu'  # Ensure config uses CPU
                 agent = DiffusionStateAgent(env, agent_config['config'], agent_config['training_config'])
                 
-                # Load state dict with CPU mapping
+                # Load state dict ensuring CPU
                 state_dict = torch.load(agent_state_dict, map_location='cpu')
+                state_dict = ensure_cpu_state_dict(state_dict)
+                
+                # Load active inference state
                 agent.active_inference.load_state_dict(state_dict['active_inference_state'])
                 
             elif agent_class == "DiffusionPixelAgent":
                 from active_inference_diffusion.agents.pixel_agent import DiffusionPixelAgent
                 from active_inference_diffusion.configs.config import ActiveInferenceConfig, TrainingConfig, PixelObservationConfig
-                
+                agent_config['config'].device = 'cpu'
                 agent = DiffusionPixelAgent(
                     env, 
                     agent_config['config'], 
@@ -75,36 +124,49 @@ def env_worker(remote, parent_remote, env_fn_wrapper, agent_state_dict, agent_cl
                     agent_config['pixel_config']
                 )
                 
-                # Load state dict with CPU mapping
+                # Load state dict ensuring CPU
                 state_dict = torch.load(agent_state_dict, map_location='cpu')
+                state_dict = ensure_cpu_state_dict(state_dict)
+                
                 agent.active_inference.load_state_dict(state_dict['active_inference_state'])
-                if hasattr(agent, 'encoder'):
+                if 'encoder_state' in state_dict and hasattr(agent, 'encoder'):
                     agent.encoder.load_state_dict(state_dict['encoder_state'])
-                    agent.encoder.to('cpu')
-                    if hasattr(agent, "representation_predictor"):
-                        agent.representation_predictor.to('cpu')
-            # Ensure agent is on CPU and in eval mode
+                    
+            # Ensure everything is on CPU and in eval mode
             agent.device = torch.device('cpu')
-            agent.active_inference = agent.active_inference.to('cpu')
-            if hasattr(agent, 'encoder'):
-                agent.encoder = agent.encoder.to('cpu')
-            agent.active_inference.eval()
             
+            # Move all components to CPU recursively
+            agent.active_inference = move_to_cpu_recursive(agent.active_inference)
+            
+            if hasattr(agent, 'encoder'):
+                agent.encoder = move_to_cpu_recursive(agent.encoder)
+            
+            if hasattr(agent, 'augmentation') and agent.augmentation is not None:
+                agent.augmentation = move_to_cpu_recursive(agent.augmentation)
+            
+            # Set to eval mode and disable gradients
+            agent.active_inference.eval()
+            if hasattr(agent, 'encoder'):
+                agent.encoder.eval()
+            
+            # Disable gradients for all parameters
+            for param in agent.active_inference.parameters():
+                param.requires_grad = False
+            
+            if hasattr(agent, 'encoder'):
+                for param in agent.encoder.parameters():
+                    param.requires_grad = False
+            return True
+
         except Exception as e:
             print(f"Failed to create agent in worker: {e}")
             import traceback
             traceback.print_exc()
-            # Send error in expected format
-            if cmd == 'act':
-                # Send random action with error info
-                action = env.action_space.sample()
-                remote.send((action, {'error': str(e)}))
-            elif cmd == 'step':
-                # Send dummy step result
-                obs, _ = env.reset()
-                remote.send((obs, 0.0, True, {'error': str(e)}))
-            else:
-                remote.send(('error', str(e)))
+            return False
+    
+    # Try to create agent
+    agent_created = create_agent()
+
 
     
     while True:
@@ -113,9 +175,16 @@ def env_worker(remote, parent_remote, env_fn_wrapper, agent_state_dict, agent_cl
             
             if cmd == 'step':
                 # Execute environment step
-                obs, reward, terminated, truncated, info = env.step(data)
-                done = terminated or truncated
-                remote.send((obs, reward, done, info))
+                try:
+                    # Execute environment step
+                    obs, reward, terminated, truncated, info = env.step(data)
+                    done = terminated or truncated
+                    remote.send((obs, reward, done, info))
+                except Exception as e:
+                    print(f"Step error: {e}")
+                    # Send error result but continue
+                    obs, _ = env.reset()
+                    remote.send((obs, 0.0, True, {'error': str(e)}))
                 
             elif cmd == 'reset':
                 obs, info = env.reset()
@@ -123,16 +192,48 @@ def env_worker(remote, parent_remote, env_fn_wrapper, agent_state_dict, agent_cl
                 
             elif cmd == 'act':
                 # Agent selects action
-                if agent is not None:
-                    obs = data
-                    with torch.no_grad():
-                        action, action_info = agent.act(obs, deterministic=False)
-                    remote.send((action, action_info))
+                if agent is not None and agent_created:
+                    try:
+                        obs = data
+                        with torch.no_grad():
+                            # Ensure observation is properly formatted
+                            if isinstance(obs, np.ndarray):
+                                obs_tensor = torch.from_numpy(obs).float().cpu()
+                            else:
+                                obs_tensor = obs.cpu() if hasattr(obs, 'cpu') else obs
+                            if hasattr(agent.active_inference, 'device') and agent.active_inference.device.type == 'cuda':
+                                print("Warning: Agent still on CUDA, forcing to CPU")
+                                agent.active_inference = move_to_cpu_recursive(agent.active_inference)
+                                agent.device = torch.device('cpu')
+                               
+                            # Get action
+                            action, action_info = agent.act(obs_tensor, deterministic=False)
+
+                            # Ensure action is numpy array with correct shape
+                            if isinstance(action, torch.Tensor):
+                                action = action.cpu().numpy()
+                            
+                            # Validate action shape
+                            if action.ndim == 0:
+                                action = np.array([action])
+                            elif action.shape[-1] != env.action_space.shape[0]:
+                                print(f"Action shape mismatch: {action.shape} vs {env.action_space.shape}")
+                                action = np.zeros(env.action_space.shape[0])
+                                
+                        remote.send((action, action_info))
+                        
+                    except Exception as e:
+                        print(f"Action selection error: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        # Send random action on error
+                        action = env.action_space.sample()
+                        remote.send((action, {'error': str(e)}))
                 else:
-                    # Random action if no agent
+                    # No agent or agent creation failed - use random action
                     action = env.action_space.sample()
-                    remote.send((action, {}))
-                    
+                    remote.send((action, {'no_agent': True}))
+                   
             elif cmd == 'render':
                 if data == 'rgb_array':
                     frame = env.render()
@@ -152,7 +253,10 @@ def env_worker(remote, parent_remote, env_fn_wrapper, agent_state_dict, agent_cl
             print(f"Worker error: {e}")
             import traceback
             traceback.print_exc()
-            remote.send(('error', str(e)))
+            try:
+                remote.send(('error', str(e)))
+            except:
+                break
 
 
 class ParallelDataCollector:
@@ -179,11 +283,7 @@ class ParallelDataCollector:
             num_envs: Number of parallel environments
             device: Device for main agent (workers always use CPU)
         """
-        # Set spawn method for CUDA compatibility
-        try:
-            mp.set_start_method('spawn', force=True)
-        except RuntimeError:
-            pass  # Already set
+
         
         self.num_envs = num_envs
         self.device = device
@@ -291,48 +391,63 @@ class ParallelDataCollector:
             for i, remote in enumerate(self.remotes):
                 try:
                     result = remote.recv()
+                    
                     if isinstance(result, tuple) and len(result) == 4:
                         next_obs, reward, done, info = result
+                        
+                        # Add to replay buffer only if we have valid data
+                        if isinstance(self.observations[i], np.ndarray) and isinstance(actions[i], np.ndarray):
+                            replay_buffer.add(
+                                self.observations[i],
+                                actions[i],
+                                float(reward),
+                                next_obs,
+                                bool(done)
+                            )
+                            
+                            # Update statistics
+                            episode_rewards[i] += reward
+                            episode_lengths[i] += 1
+                            steps_collected += 1
+                        
+                        if done:
+                            # Episode completed
+                            total_rewards.append(episode_rewards[i])
+                            episodes_completed += 1
+                            
+                            # Reset this environment
+                            remote.send(('reset', None))
+                            obs, info = remote.recv()
+                            self.observations[i] = obs
+                            
+                            # Reset episode stats
+                            episode_rewards[i] = 0.0
+                            episode_lengths[i] = 0
+                        else:
+                            self.observations[i] = next_obs
+                            
                     else:
-                        # Handle error case
-                        print(f"Unexpected result format: {result}")
-                        # Reset environment on error
+                        # Handle unexpected result format
+                        print(f"Unexpected result format from env {i}: {type(result)}")
+                        # Reset environment
                         remote.send(('reset', None))
-                        next_obs, info = remote.recv()
-                        reward = 0
-                        done = True
+                        obs, info = remote.recv()
+                        self.observations[i] = obs
+                        episode_rewards[i] = 0.0
+                        episode_lengths[i] = 0
+                        
                 except Exception as e:
-                    raise ValueError(f"Error receiving step result from environment {i}: {e}")
-                # Add to replay buffer
-                replay_buffer.add(
-                    self.observations[i],
-                    actions[i],
-                    reward,
-                    next_obs,
-                    done
-                )
-                
-                # Update statistics
-                episode_rewards[i] += reward
-                episode_lengths[i] += 1
-                steps_collected += 1
-                
-                if done:
-                    # Episode completed
-                    total_rewards.append(episode_rewards[i])
-                    episodes_completed += 1
-                    
-                    # Reset this environment
-                    remote.send(('reset', None))
-                    obs, info = remote.recv()
-                    self.observations[i] = obs
-                    
-                    # Reset episode stats
+                    print(f"Error receiving step result from env {i}: {e}")
+                    # Reset on error
+                    try:
+                        remote.send(('reset', None))
+                        obs, info = remote.recv()
+                        self.observations[i] = obs
+                    except:
+                        print(f"Failed to reset env {i}")
                     episode_rewards[i] = 0.0
                     episode_lengths[i] = 0
-                else:
-                    self.observations[i] = next_obs
-        
+
         # Compute statistics
         stats = {
             'steps_collected': steps_collected,
@@ -391,6 +506,25 @@ class ParallelDataCollector:
     
     def __del__(self):
         self.close()
+
+def ensure_cpu_state_dict(state_dict):
+    """Recursively ensure all tensors in state dict are on CPU"""
+    cpu_state_dict = {}
+    for key, value in state_dict.items():
+        if isinstance(value, torch.Tensor):
+            cpu_state_dict[key] = value.detach().cpu().clone()  # Clone to break CUDA references
+        elif isinstance(value, dict):
+            cpu_state_dict[key] = ensure_cpu_state_dict(value)
+        elif isinstance(value, (list, tuple)):
+            cpu_state_dict[key] = type(value)(
+                ensure_cpu_state_dict({"_": item})["_"] if isinstance(item, (dict, torch.Tensor)) 
+                else item for item in value
+            )
+        elif hasattr(value, 'state_dict'):  # Handle nested modules
+            cpu_state_dict[key] = ensure_cpu_state_dict(value.state_dict())
+        else:
+            cpu_state_dict[key] = value
+    return cpu_state_dict
 
 
 def create_parallel_collector(

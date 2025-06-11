@@ -154,26 +154,7 @@ class BaseActiveInferenceAgent(ABC):
             action: Selected action
             info: Additional information
         """
-        # Convert to tensor
-        obs_tensor = self._process_observation(observation)
-        obs_tensor = obs_tensor.to(self.device)
-        
-        # Get action from active inference
-        with torch.no_grad():
-            action_tensor, info = self.active_inference.act(
-                obs_tensor,
-                deterministic=deterministic
-            )
-            
-        # Convert to numpy
-        action = action_tensor.cpu().numpy().squeeze()
-        
-        # Add exploration noise if training
-        if not deterministic and self.training and self.exploration_noise > 0:
-            noise = np.random.normal(0, self.exploration_noise, size=action.shape)
-            action = np.clip(action + noise, -1, 1)
-            
-        return action, info
+        pass
         
     @abstractmethod
     def _process_observation(self, observation: np.ndarray) -> torch.Tensor:

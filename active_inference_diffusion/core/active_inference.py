@@ -15,6 +15,7 @@ from ..models.policy_networks import DiffusionConditionedPolicy
 from ..models.value_networks import ValueNetwork
 from ..models.dynamics_models import LatentDynamicsModel
 from ..utils.util import SpatialAttentionAggregator
+
 class DiffusionActiveInference(nn.Module):
     """
     Core Active Inference implementation with diffusion-generated latents
@@ -42,7 +43,7 @@ class DiffusionActiveInference(nn.Module):
         self.pixel_shape = pixel_shape 
         self.is_pixel_observation = config.pixel_observation
         self.epistemic_dropout_rate = 0.2
-        self.device = config.device 
+        self.device = torch.device(config.device)
         if self.is_pixel_observation and pixel_shape is not None:
             self.raw_observation_shape = pixel_shape
         else:
@@ -147,16 +148,18 @@ class DiffusionActiveInference(nn.Module):
                 nn.Tanh()
                 )
             observation_shape = self.pixel_shape  # For pixel observations
+
+        # Epistemic estimator for latent uncertainty
         self.epistemic_estimator = FunctionSpaceEpistemicEstimator(
             decoder=self.observation_decoder,
             latent_dim=self.latent_dim,
-            observation_shape= observation_shape,
+            observation_shape=observation_shape,
             hidden_dim=self.config.hidden_dim,
-            is_pixel_observation= self.is_pixel_observation,
+            is_pixel_observation=self.is_pixel_observation,
             device=self.device
             )
 
-        #initialize a reward predictor
+        # Initialize a reward predictor
         self.reward_predictor = nn.Sequential(
             nn.Linear(self.latent_dim, self.config.hidden_dim),
             nn.LayerNorm(self.config.hidden_dim),
@@ -165,6 +168,51 @@ class DiffusionActiveInference(nn.Module):
             nn.ReLU(),
             nn.Linear(self.config.hidden_dim // 2, 2)
         )
+
+    def to(self, device):
+        """Override to ensure ALL components move to device"""
+        # Convert device to torch.device if needed
+        if isinstance(device, str):
+            device = torch.device(device)
+        
+        # Call parent to() method
+        super().to(device)
+        
+        # Update our device attribute
+        self.device = device
+        
+        # Explicitly move all components
+        self.latent_diffusion = self.latent_diffusion.to(device)
+        self.latent_score_network = self.latent_score_network.to(device)
+        self.policy_network = self.policy_network.to(device)
+        self.value_network = self.value_network.to(device)
+        self.latent_dynamics = self.latent_dynamics.to(device)
+        self.reward_predictor = self.reward_predictor.to(device)
+        
+        # Handle observation decoder based on type
+        if isinstance(self.observation_decoder, nn.ModuleList):
+            # For state observations - move each module in the list
+            for i in range(len(self.observation_decoder)):
+                self.observation_decoder[i] = self.observation_decoder[i].to(device)
+        else:
+            # For pixel observations
+            self.observation_decoder = self.observation_decoder.to(device)
+            
+        # Move feature decoder if it exists
+        if hasattr(self, 'feature_decoder'):
+            self.feature_decoder = self.feature_decoder.to(device)
+            
+        # Move epistemic estimator with explicit device update
+        self.epistemic_estimator = self.epistemic_estimator.to(device)
+        self.epistemic_estimator.device = device  # Update its device attribute
+        
+        # Move buffers
+        self.reward_mean = self.reward_mean.to(device)
+        self.reward_var = self.reward_var.to(device)
+        self.preference_temperature = self.preference_temperature.to(device)
+        
+        return self
+        
     def decode_observation(self, latent: torch.Tensor, decode_to_pixels: bool = True) -> torch.Tensor:
         """
         decoding that can decode to either pixels or features
@@ -186,14 +234,10 @@ class DiffusionActiveInference(nn.Module):
         else:
             # For non-pixel observations, use fully connected decoder
             h = latent
-            # First layer
             h1 = self.observation_decoder[0](h)
-            # Second layer with skip
             h2 = self.observation_decoder[1](h1)
             h2 = h2 + h1  # Skip connection
-            # Third layer
             h3 = self.observation_decoder[2](h2)
-            # Output layer
             return self.observation_decoder[3](h3)
         
 
@@ -463,6 +507,7 @@ class DiffusionActiveInference(nn.Module):
             latent,
             deterministic=deterministic
         )
+        action =action.cpu()
         # Ensure action has proper shape
         if action.dim() > 2:
             action = action.squeeze()
@@ -475,11 +520,11 @@ class DiffusionActiveInference(nn.Module):
         
         # Compile information
         info = {
-            **belief_info,
-            'expected_free_energy': efe.mean().item(),
-            'action_log_prob': log_prob.mean().item(),
-            'policy_entropy': policy_dist.entropy().sum(dim=-1).mean().item(),
-            **efe_info
+        **belief_info,
+        'expected_free_energy': efe.mean().cpu().item(),
+        'action_log_prob': log_prob.mean().cpu().item(),
+        'policy_entropy': policy_dist.entropy().sum(dim=-1).mean().cpu().item(),
+        **{k: v.cpu().item() if torch.is_tensor(v) else v for k, v in efe_info.items()}
         }
         
         return action, info
@@ -718,33 +763,7 @@ class DiffusionActiveInference(nn.Module):
             current_weight = self.time_importance_weights[time_bin].item()
             new_weight = 0.99 * current_weight + 0.01 * sample_loss
             self.time_importance_weights[time_bin] = new_weight
-    def to(self, device):
-        """Override to ensure all components move to the specified device"""
-        super().to(device)
-        self.device = device
-    
-        # Ensure all sub-models are on the correct device
-        if hasattr(self, 'feature_decoder'):
-            self.feature_decoder = self.feature_decoder.to(device)
-        if hasattr(self, 'observation_decoder'):
-            if isinstance(self.observation_decoder, nn.ModuleList):
-                for i in range(len(self.observation_decoder)):
-                    self.observation_decoder[i] = self.observation_decoder[i].to(device)
-            else:
-                self.observation_decoder = self.observation_decoder.to(device)
-    
-        # Move all other components
-        for name, module in self.named_children():
-            if module is not None:
-                module.to(device)
-            
-        # Move buffers
-        self.reward_mean = self.reward_mean.to(device)
-        self.reward_var = self.reward_var.to(device)
-        self.preference_temperature = self.preference_temperature.to(device)
-    
-        return self
-    
+
 def extract(a: torch.Tensor, t: torch.Tensor, x_shape: Tuple) -> torch.Tensor:
     """Extract coefficients helper"""
     batch_size = t.shape[0]
@@ -897,18 +916,33 @@ class FunctionSpaceEpistemicEstimator(nn.Module):
         self.alpha = 0.01
         self.to(self.device)
 
+    def to(self, device):
+        """Override to ensure proper device movement"""
+        super().to(device)
+        self.device = device if isinstance(device, torch.device) else torch.device(device)
+        
+        # Ensure decoder is also moved properly
+        if isinstance(self.decoder, nn.ModuleList):
+            for i in range(len(self.decoder)):
+                self.decoder[i] = self.decoder[i].to(device)
+        else:
+            self.decoder = self.decoder.to(device)
+            
+        return self
+
     def compute_jacobian_features(self, z: torch.Tensor) -> torch.Tensor:
         """
         Approximates function-space features via finite differences
         in the neural tangent kernel regime
         """
-        z= z.to(self.device)
+        z = z.to(self.device)
         batch_size = z.shape[0]
         jacobian_samples = []
+        decoder_training = self.decoder.training
+        self.decoder.eval()  # Ensure decoder is in eval mode
         # Base decoding
         with torch.no_grad():
-            decoder_training = self.decoder.training
-            self.decoder.eval()  
+             
             f_z = self.decoder(z)  # (B, 3, 84, 84)
             if self.is_pixel and f_z.dim() == 4:  # (B, C, H, W)
                 f_z_flat = f_z.view(batch_size, -1)
@@ -918,8 +952,8 @@ class FunctionSpaceEpistemicEstimator(nn.Module):
         # Compute directional derivatives
         for _ in range(self.ntk_samples):
             # Sample perturbation direction
-            delta = F.normalize(torch.randn_like(z), dim=-1) * epsilon
-            
+            delta = F.normalize(torch.randn_like(z).to(self.device), dim=-1) * epsilon
+
             # Compute finite difference
             with torch.no_grad():
                 f_z_perturbed = self.decoder(z + delta)

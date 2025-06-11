@@ -302,7 +302,7 @@ class ConvDecoder(nn.Module):
         # Block 4: Upsample 42x42 -> 84x84
         self.decoder_blocks.append(
             DecoderBlock(
-                in_channels=hidden_dim // 2,
+                in_channels=hidden_dim // 4,
                 out_channels=hidden_dim // 8,
                 upsample=True,
                 use_spectral_norm=use_spectral_norm

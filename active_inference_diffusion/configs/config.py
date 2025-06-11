@@ -62,8 +62,8 @@ class ActiveInferenceConfig:
     num_layers: int = 3
     pixel_observation: bool = False  # Use pixel observations
     # Training
-    batch_size: int = 256
-    learning_rate: float = 3e-4
+    batch_size: int = 128
+    learning_rate: float = 5e-5
     gradient_clip: float = 1.0
 
     # Reward-oriented Active Inference parameters

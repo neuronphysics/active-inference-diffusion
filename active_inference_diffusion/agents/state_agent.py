@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import gymnasium as gym
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Any
 
 from .base_agent import BaseActiveInferenceAgent
 from ..core.active_inference import DiffusionActiveInference
@@ -68,6 +68,44 @@ class DiffusionStateAgent(BaseActiveInferenceAgent):
     def _process_batch_observations(self, observations: torch.Tensor) -> torch.Tensor:
         """Process batch of state observations"""
         return observations.to(self.device)
+        
+    def act(
+        self,
+        observation: np.ndarray,
+        deterministic: bool = False
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """
+        Select action using active inference
+        
+        Args:
+            observation: Environment observation
+            deterministic: Whether to use deterministic policy
+            
+        Returns:
+            action: Selected action
+            info: Additional information
+        """
+        #TODO:Please check whether this works for normal observation
+        # Convert to tensor
+        obs_tensor = self._process_observation(observation)
+        obs_tensor = obs_tensor.to(self.device)
+        
+        # Get action from active inference
+        with torch.no_grad():
+            action_tensor, info = self.active_inference.act(
+                obs_tensor,
+                deterministic=deterministic
+            )
+            
+        # Convert to numpy
+        action = action_tensor.cpu().numpy().squeeze()
+        
+        # Add exploration noise if training
+        if not deterministic and self.training and self.exploration_noise > 0:
+            noise = np.random.normal(0, self.exploration_noise, size=action.shape)
+            action = np.clip(action + noise, -1, 1)
+            
+        return action, info
         
     def train_step(self) -> Dict[str, float]:
         """Enhanced training step for diffusion active inference"""

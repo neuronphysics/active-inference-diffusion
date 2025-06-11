@@ -121,14 +121,14 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
         Pipeline: pixels -> features -> diffusion latents -> policy
         """
         # Process raw pixels
-        obs_tensor = self._process_observation(observation).to(self.device)
+        obs_tensor = self._process_observation(observation)
         
         # Encode to feature space
         with torch.no_grad():
-            if hasattr(self, 'encoder'):
+            if hasattr(self, 'encoder') and self.encoder is not None:
                 self.encoder = self.encoder.to(self.device)
 
-            encoded_obs = self.encode_observation(obs_tensor)
+            encoded_obs = self.encode_observation(obs_tensor.to(self.device))
             if encoded_obs.dim() == 1:
                encoded_obs = encoded_obs.unsqueeze(0)
             
@@ -423,18 +423,19 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
         Ensures latent dynamics align with visual features
         """
         # Predict next visual features from current latent and action
-        predicted_next_latent = self.active_inference.predict_next_latent(latents, actions)
-        
+        predicted_next_latent, predicted_logvar = self.active_inference.predict_next_latent(latents, actions)
+        predicted_std = torch.exp(0.5 * predicted_logvar)
         # Normalize for contrastive loss
         pred_norm = F.normalize(predicted_next_latent, dim=-1)
         target_norm = F.normalize(next_obs, dim=-1)
-        
+        uncertainty_weights = 1.0 / (1.0 + predicted_std.mean(dim=-1, keepdim=True))        
         # InfoNCE loss
         logits = torch.matmul(pred_norm, target_norm.T) / 0.1
+        weighted_logits = logits * uncertainty_weights
         labels = torch.arange(obs.shape[0], device=obs.device)
-        
-        return F.cross_entropy(logits, labels)
-        
+
+        return F.cross_entropy(weighted_logits, labels)
+
     def _setup_optimizers(self):
         """Setup optimizers including visual components"""
         # Score network optimizer (includes encoder)
