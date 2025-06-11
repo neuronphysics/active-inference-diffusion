@@ -641,15 +641,16 @@ class DiffusionActiveInference(nn.Module):
         next_values: torch.Tensor,
         dones: torch.Tensor,
         lambda_: float = 0.95,
-        n_steps: int = 5
+        n_steps: int = 5,
+        exclude_immediate_rewards: bool = False
     ) -> torch.Tensor:
         """
         Compute λ-returns as in Dreamer v2.
     
         The λ-return is a weighted average of n-step returns:
-        G^λ_t = (1-λ) Σ_{n=1}^{N-1} λ^{n-1} G^n_t + λ^{N-1} G^N_t
-    
-        Where G^n_t is the n-step return.
+        When exclude_immediate_reward=True, returns are computed without immediate rewards,
+        making the value function learn V(s) = E[Σ_{t'=t+1}^T γ^{t'-t} r_{t'}]
+        instead of V(s) = E[Σ_{t'=t}^T γ^{t'-t} r_{t'}]
         """
         batch_size = rewards.shape[0]
         device = rewards.device
@@ -669,9 +670,10 @@ class DiffusionActiveInference(nn.Module):
                 # Sum discounted rewards for n steps
                 for k in range(n):
                     if idx + k < batch_size:
-                        n_step_return += discount * rewards[idx + k]
+                        if not (exclude_immediate_rewards and k == 0):
+                            n_step_return += discount * rewards[idx + k]
                         discount *= self.config.discount_factor * (1 - dones[idx + k].float())
-                    
+
                 # Add bootstrapped value
                 if idx + n < batch_size and not dones[idx + n - 1]:
                     n_step_return += discount * next_values[idx + n]
@@ -696,8 +698,11 @@ class DiffusionActiveInference(nn.Module):
                 
                 lambda_returns[idx] = weighted_return / (lambda_sum + 1e-8)
             else:
-                lambda_returns[idx] = rewards[idx] + self.config.discount_factor * (1 - dones[idx].float()) * next_values[idx]
-    
+                if exclude_immediate_rewards:
+                    lambda_returns[idx] = self.config.discount_factor * (1 - dones[idx].float()) * next_values[idx]
+                else:
+                    lambda_returns[idx] = rewards[idx] + self.config.discount_factor * (1 - dones[idx].float()) * next_values[idx]
+   
         return lambda_returns
       
     def _compute_gradient_penalty(
