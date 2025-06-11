@@ -100,12 +100,12 @@ def train_diffusion_active_inference(
         latent_dim=50,
         hidden_dim=256,
         learning_rate=5e-5,
-        batch_size=256,
+        batch_size=512,
         efe_horizon=5,
         epistemic_weight=0.1,
         pragmatic_weight=1.0,
         consistency_weight=0.1,
-        kl_weight=0.1,
+        kl_weight=0.5,
         diffusion_weight=1.0,
         pixel_observation=use_pixels,
         device=device
@@ -113,7 +113,7 @@ def train_diffusion_active_inference(
     
     # Enhanced diffusion config
     config.diffusion = DiffusionConfig(
-        num_diffusion_steps=50,  # Fewer steps for faster inference
+        num_diffusion_steps=40,  # Fewer steps for faster inference
         beta_schedule="cosine",
         beta_start=1e-4,
         beta_end=0.02
@@ -126,7 +126,7 @@ def train_diffusion_active_inference(
         log_frequency=1_000,
         buffer_size=buffer_size,
         learning_starts=5_000,
-        gradient_steps=2,
+        gradient_steps=4,
         exploration_noise=0.1,
         exploration_decay=0.999,
         num_parallel_envs=num_parallel_envs  # Set number of parallel envs
@@ -310,7 +310,7 @@ if __name__ == "__main__":
         parser.add_argument('--timesteps', type=int, default=1_000_000)
         parser.add_argument('--seed', type=int, default=0)
         parser.add_argument('--device', type=str, default='cuda')
-        parser.add_argument('--num_parallel_envs', type=int, default=3,
+        parser.add_argument('--num_parallel_envs', type=int, default=2,
                             help='Number of parallel environments for data collection')
     
         args = parser.parse_args()

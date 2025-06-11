@@ -62,7 +62,7 @@ class ActiveInferenceConfig:
     num_layers: int = 3
     pixel_observation: bool = False  # Use pixel observations
     # Training
-    batch_size: int = 128
+    batch_size: int = 256
     learning_rate: float = 5e-5
     gradient_clip: float = 1.0
 
@@ -114,7 +114,7 @@ class TrainingConfig:
     buffer_size: int = 100_000
     learning_starts: int = 5_000
     train_frequency: int = 2
-    gradient_steps: int = 2
+    gradient_steps: int = 4
     num_parallel_envs: int = 6  # Number of parallel environments for training
     # Evaluation
     num_eval_episodes: int = 10

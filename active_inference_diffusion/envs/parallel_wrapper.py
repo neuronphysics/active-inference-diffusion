@@ -111,8 +111,8 @@ def env_worker(remote, parent_remote, env_fn_wrapper, agent_state_dict, agent_cl
                 state_dict = ensure_cpu_state_dict(state_dict)
                 
                 # Load active inference state
-                agent.active_inference.load_state_dict(state_dict['active_inference_state'])
-                
+                agent.active_inference.load_state_dict(state_dict['active_inference_state'], strict=False)
+
             elif agent_class == "DiffusionPixelAgent":
                 from active_inference_diffusion.agents.pixel_agent import DiffusionPixelAgent
                 from active_inference_diffusion.configs.config import ActiveInferenceConfig, TrainingConfig, PixelObservationConfig
@@ -128,7 +128,7 @@ def env_worker(remote, parent_remote, env_fn_wrapper, agent_state_dict, agent_cl
                 state_dict = torch.load(agent_state_dict, map_location='cpu')
                 state_dict = ensure_cpu_state_dict(state_dict)
                 
-                agent.active_inference.load_state_dict(state_dict['active_inference_state'])
+                agent.active_inference.load_state_dict(state_dict['active_inference_state'], strict=False)
                 if 'encoder_state' in state_dict and hasattr(agent, 'encoder'):
                     agent.encoder.load_state_dict(state_dict['encoder_state'])
                     

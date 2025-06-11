@@ -314,7 +314,7 @@ class DiffusionActiveInference(nn.Module):
         self,
         latent: torch.Tensor,
         horizon: int = 5,
-        num_trajectories: int = 15,
+        num_trajectories: int = 10,
         num_ambiguity_samples: int = 10
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
@@ -852,7 +852,7 @@ class FunctionSpaceEpistemicEstimator(nn.Module):
         self.device = torch.device(device) if isinstance(device, str) else device
         
         # Jacobian approximation parameters
-        self.ntk_samples = 5
+        self.ntk_samples = 4
         self.perturbation_scale = nn.Parameter(torch.tensor(0.1)).to(self.device)
         
         if self.is_pixel:
@@ -968,8 +968,9 @@ class FunctionSpaceEpistemicEstimator(nn.Module):
             
             # Process through pixel encoder
             if self.is_pixel:
-                # Process pixel differences
-                diff_img = diff.view(batch_size, *self.pixel_shape)
+                # Process pixel differences (use the decoder’s real output shape)
+                _, C, H, W = f_z.shape
+                diff_img = diff.view(batch_size, C, H, W)
                 diff_features = self.pixel_processor(diff_img)
                 spatial_features, _ = self.spatial_aggregator(diff_features)
                 jacobian_samples.append(spatial_features.view(batch_size, -1))
