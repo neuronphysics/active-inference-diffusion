@@ -100,7 +100,7 @@ def train_diffusion_active_inference(
         latent_dim=50,
         hidden_dim=256,
         learning_rate=5e-5,
-        batch_size=512,
+        batch_size=1024,
         efe_horizon=5,
         epistemic_weight=0.1,
         pragmatic_weight=1.0,
@@ -310,7 +310,7 @@ if __name__ == "__main__":
         parser.add_argument('--timesteps', type=int, default=1_000_000)
         parser.add_argument('--seed', type=int, default=0)
         parser.add_argument('--device', type=str, default='cuda')
-        parser.add_argument('--num_parallel_envs', type=int, default=2,
+        parser.add_argument('--num_parallel_envs', type=int, default=3,
                             help='Number of parallel environments for data collection')
     
         args = parser.parse_args()
