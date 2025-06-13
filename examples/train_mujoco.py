@@ -217,7 +217,7 @@ def train_diffusion_active_inference(
         )
         
         # Override diffusion steps for faster collection
-        collector.gpu_inference.max_diffusion_steps = 40  # Reduced from 40
+        collector.gpu_inference.max_diffusion_steps = 30  # Reduced from 40
         
     else:
         # Fallback to CPU-based parallel collector
@@ -256,7 +256,7 @@ def train_diffusion_active_inference(
     print(f"Starting training with {num_parallel_envs} parallel environments...")
     print(f"Using {collector_type.upper()} collector for data collection")
     if use_gpu_collector and device == "cuda":
-        print(f"Diffusion steps reduced to {collector.gpu_inference.max_diffusion_steps} for faster GPU inference")
+        print(f"Diffusion steps are {collector.gpu_inference.max_diffusion_steps} for faster GPU inference")
     
     # Main training loop
     try:

@@ -117,7 +117,7 @@ class GPUCentralizedCollector:
                 inference_future = self.gpu_inference.submit_batch(obs_batch)
                 
                 # Overlap: while GPU computes, prepare next batch or handle results
-                actions_batch = inference_future.get(timeout=20.0)  # GPU inference result
+                actions_batch = inference_future.get(timeout=300.0)  # GPU inference result
                 
                 # Distribute actions to environment workers
                 step_futures = self._distribute_actions(actions_batch)
@@ -390,6 +390,7 @@ class AsyncGPUInference:
         Optimized batched reverse diffusion with reduced steps
         Implements parallel sampling across batch dimension
         """
+        self.timeout = max(10, num_steps * 0.5)
         batch_size = observations_batch.shape[0]
         latent_dim = self.agent.config.latent_dim
         if num_steps is None:
@@ -506,6 +507,15 @@ class EnvironmentWorker:
         future = self.executor.submit(step_with_action)
         return {'action': action, 'result': future}
     
+    def close(self):
+        """Clean up worker resources"""
+        try:
+            if self.env is not None:
+                self.env.close()
+            if self.executor is not None:
+                self.executor.shutdown(wait=True, cancel_futures=True)
+        except Exception as e:
+            print(f"Error in worker {self.worker_id} cleanup: {e}")   
 
 def create_gpu_collector(
     env_name: str,

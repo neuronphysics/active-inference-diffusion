@@ -30,7 +30,8 @@ class Logger:
             wandb.init(
                 project=project_name,
                 name=experiment_name,
-                config=config
+                config=config,
+                settings=wandb.Settings(init_timeout=200), 
             )
             
         # Create local log file
