@@ -115,8 +115,8 @@ def save_checkpoint(
     # Save checkpoint
     full_path = checkpoint_path / filename
     torch.save(checkpoint, full_path)
-    print(f"✅ Saved checkpoint: {full_path}")
-    
+    print(f"Saved checkpoint: {full_path}")
+
     # Also save a 'latest' checkpoint for easy resuming
     latest_path = checkpoint_path / "latest.pt"
     torch.save(checkpoint, latest_path)
@@ -174,9 +174,6 @@ def load_checkpoint(
 """
 Video creation and plotting utilities
 """
-
-
-
 
 def create_video(
     agent: Any,

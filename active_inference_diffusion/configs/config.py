@@ -64,7 +64,7 @@ class ActiveInferenceConfig:
     # Training
     batch_size: int = 256
     learning_rate: float = 5e-5
-    gradient_clip: float = 1.0
+    gradient_clip: float = 0.5  # Gradient clipping value
 
     # Reward-oriented Active Inference parameters
     preference_temperature: float = 1.0  # τ in P(o) ∝ exp(r(o)/τ)

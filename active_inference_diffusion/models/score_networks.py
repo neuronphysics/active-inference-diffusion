@@ -163,6 +163,7 @@ class LatentScoreNetwork(nn.Module):
         # Final norm and output
         h = self.norm_final(h, conditioning)
         score = self.output_proj(h)
+        score = torch.clamp(score, min=-10, max=10)
         score = score * self.output_multiplier  # Scale output
         if is_continuous:
             # Apply time-dependent scaling for continuous time

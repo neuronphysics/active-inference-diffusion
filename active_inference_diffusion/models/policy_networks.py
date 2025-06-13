@@ -72,6 +72,24 @@ class DiffusionConditionedPolicy(nn.Module):
         else:
             # Learnable but state-independent std
             self.log_std = nn.Parameter(torch.zeros(action_dim))
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        # Small initialization for output layers to prevent large initial actions
+        nn.init.uniform_(self.mean_head[-1].weight, -3e-3, 3e-3)
+        nn.init.zeros_(self.mean_head[-1].bias)
+    
+        if self.use_state_dependent_std:
+            nn.init.uniform_(self.log_std_head[-1].weight, -3e-3, 3e-3)
+            nn.init.zeros_(self.log_std_head[-1].bias)
+    
+        # Xavier/He init for other layers
+        for m in [self.latent_encoder, self.trunk, self.mean_head[:-1]]:
+            for layer in m.modules():
+                if isinstance(layer, nn.Linear):
+                    nn.init.xavier_uniform_(layer.weight)
+                    if layer.bias is not None:
+                        nn.init.zeros_(layer.bias)
             
         
     def forward(

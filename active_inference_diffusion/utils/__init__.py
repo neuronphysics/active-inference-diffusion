@@ -17,5 +17,6 @@ __all__ = [
     "create_video",
     "plot_training_curves",
     "visualize_reconstruction",
-    "SpatialAttentionAggregator"
+    "SpatialAttentionAggregator",
+
 ]

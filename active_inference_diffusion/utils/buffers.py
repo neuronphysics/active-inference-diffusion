@@ -93,8 +93,11 @@ class ReplayBuffer:
                 obs_list.append(self._decompress_with_shape(self.observations[i]))
                 next_obs_list.append(self._decompress_with_shape(self.next_observations[i]))
                 
-            obs = torch.stack([torch.from_numpy(o).float() for o in obs_list])
-            next_obs = torch.stack([torch.from_numpy(o).float() for o in next_obs_list])
+                obs_list.append(torch.from_numpy(obs).float() / 255.0)
+                next_obs_list.append(torch.from_numpy(next_obs).float() / 255.0)
+                
+            obs = torch.stack(obs_list)
+            next_obs = torch.stack(next_obs_list)
         else:
             obs = self.observations[indices]
             next_obs = self.next_observations[indices]

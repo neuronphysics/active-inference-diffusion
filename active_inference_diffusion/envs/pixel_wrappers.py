@@ -3,7 +3,7 @@ import numpy as np
 from gymnasium.spaces import Box
 from typing import Optional, Tuple, Dict, Any
 import warnings
-
+from .wrappers import ActionRepeat 
 
 class MuJoCoPixelObservationWrapper(gym.ObservationWrapper):
     """
@@ -302,8 +302,6 @@ class MultiCameraWrapper(gym.ObservationWrapper):
 
 
 # Convenience functions for common MuJoCo environments
-
-from .wrappers import ActionRepeat  # Add this import at the top of the file
 
 def make_pixel_mujoco(
     env_id: str,
