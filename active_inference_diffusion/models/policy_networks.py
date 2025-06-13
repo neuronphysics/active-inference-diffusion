@@ -76,11 +76,11 @@ class DiffusionConditionedPolicy(nn.Module):
 
     def _initialize_weights(self):
         # Small initialization for output layers to prevent large initial actions
-        nn.init.uniform_(self.mean_head[-1].weight, -3e-3, 3e-3)
+        torch.nn.init.orthogonal_(self.mean_head[-1].weight, gain=torch.tensor(1.0))
         nn.init.zeros_(self.mean_head[-1].bias)
     
         if self.use_state_dependent_std:
-            nn.init.uniform_(self.log_std_head[-1].weight, -3e-3, 3e-3)
+            torch.nn.init.orthogonal_(self.log_std_head[-1].weight, gain=torch.tensor(1.0))
             nn.init.zeros_(self.log_std_head[-1].bias)
     
         # Xavier/He init for other layers
