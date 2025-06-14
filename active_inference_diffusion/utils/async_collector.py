@@ -5,40 +5,48 @@ Separates environment stepping (CPU) from diffusion inference (GPU)
 
 import torch
 import torch.multiprocessing as mp
-from threading import Thread
-from queue import Queue, Empty
+from threading import Thread, Event
+from queue import Queue, Empty, Full
 import numpy as np
-from typing import List, Tuple, Dict, Any, Optional, Union
+from typing import List, Tuple, Dict, Any, Optional, Union, Callable
 import time
 import gymnasium as gym
 from pathlib import Path
 from active_inference_diffusion.agents.state_agent import DiffusionStateAgent
 from active_inference_diffusion.agents.pixel_agent import DiffusionPixelAgent
 from collections import deque
-import torch.nn.functional as F
-from contextlib import contextmanager
+import traceback
+from active_inference_diffusion.envs.vec_env import ShmemVectorEnv, SubprocVectorEnv
+"""
+GPU-Optimized Parallel Data Collection using SubprocVectorEnv
+"""
+
 
 class GPUCentralizedCollector:
     """
-    Hybrid CPU-GPU architecture optimizing computational resource allocation:
-    - Environment stepping and rendering: CPU workers  
-    - Diffusion inference and policy evaluation: GPU main process
-    - Asynchronous pipeline with overlapped computation
+    Hybrid CPU-GPU architecture using robust vectorized environments
+    
+    This implementation leverages the battle-tested SubprocVectorEnv for environment
+    management while maintaining your sophisticated GPU inference pipeline.
     """
     
     def __init__(
         self,
-        env_fn,
-        agent,
+        env_fn: Callable[[], Any],
+        agent: Optional[Any] = None,
         num_envs: int = 8,
         max_queue_size: int = 32,
-        use_mixed_precision: bool = True
+        use_mixed_precision: bool = True,
+        use_shared_memory: bool = True  # Enable for pixel observations
     ):
         self.num_envs = num_envs
-        # Use agent's device instead of hardcoding 'cuda'
         self.device = agent.device if hasattr(agent, 'device') else torch.device('cuda')
         self.agent = agent
-
+        self.use_shared_memory = use_shared_memory
+        self._closing = False  # Add flag to track if we're closing
+        self._pending_futures = []  # Track pending inference futures
+        
+        # Ensure agent components are on GPU and in eval mode
         if hasattr(agent, 'active_inference'):
             agent.active_inference = agent.active_inference.to(self.device)
             agent.active_inference.eval()
@@ -46,10 +54,30 @@ class GPUCentralizedCollector:
         if hasattr(agent, 'encoder'):
             agent.encoder = agent.encoder.to(self.device)
             agent.encoder.eval()
-        # Get the actual configured diffusion steps from the agent
-        actual_diffusion_steps = agent.config.diffusion.num_diffusion_steps
         
-        # Initialize async GPU inference pipeline
+        # Create environment functions with proper seeding
+        env_fns = [self._make_env_fn(env_fn, i) for i in range(num_envs)]
+        
+        # Choose the appropriate vectorized environment class
+        if use_shared_memory:
+            # ShmemVectorEnv is optimal for pixel observations
+            # It avoids copying large arrays between processes
+            self.vec_env = ShmemVectorEnv(env_fns)
+            print(f"Using ShmemVectorEnv for efficient pixel observation transfer")
+        else:
+            # SubprocVectorEnv is fine for low-dimensional state observations
+            self.vec_env = SubprocVectorEnv(env_fns, context='spawn')
+            print(f"Using SubprocVectorEnv with spawn context")
+        
+        # Initialize with first observations
+        self.current_observations, self.current_infos = self.vec_env.reset()
+        
+        # Store observation and action shapes for validation
+        self.observation_shape = self.current_observations[0].shape
+        self.action_shape = self.vec_env.action_space.shape
+        
+        # Initialize GPU inference pipeline
+        actual_diffusion_steps = agent.config.diffusion.num_diffusion_steps
         self.gpu_inference = AsyncGPUInference(
             agent=agent,
             max_queue_size=max_queue_size,
@@ -57,49 +85,47 @@ class GPUCentralizedCollector:
             max_diffusion_steps=actual_diffusion_steps
         )
         
-        # Create environment workers (CPU-only)
-        self.current_observations = [None] * num_envs
-        self.env_workers = self._create_env_workers(env_fn)
+        # Performance monitoring
+        self.step_times = []
+        self.inference_times = []
+        self.consecutive_timeouts = 0
+        self.max_consecutive_timeouts = 3
+   
+    def _make_env_fn(self, base_env_fn: Callable, worker_id: int, seed: int = 42) -> Callable:
+        """
+        Create environment function with proper seeding and initialization
         
-        # State management
-        
-        self.env_states = ['ready'] * num_envs
-        
-        
-    def _create_env_workers(self, env_fn) -> List['EnvironmentWorker']:
-        """Create CPU-bound environment workers for stepping and rendering"""
-        workers = []
-        
-        for i in range(self.num_envs):
-            worker = EnvironmentWorker(
-                env_fn=env_fn,
-                worker_id=i,
-                seed=42 + i
-            )
-            worker.start()
-            workers.append(worker)
+        This ensures each subprocess gets a properly configured environment
+        with a unique seed to avoid correlation between parallel environments.
+        """
+        def _init():
+            env = base_env_fn()
             
-        # Initialize environments and get first observations
-        for i, worker in enumerate(workers):
-            obs, _ = worker.reset()
-            self.current_observations[i] = obs
-        self.observation_shape = self.current_observations[0].shape           
-        return workers
+            # Set unique seed for this environment
+            env_seed = seed + worker_id * 1000  # Large offset to avoid overlap
+            try:
+                # Try the new API first
+                env.reset(seed=env_seed)
+            except TypeError:
+                if hasattr(env, 'seed'):
+                    env.seed(env_seed)
+                env.reset()
+            
+            # Seed action and observation spaces if possible
+            if hasattr(env.action_space, 'seed'):
+                env.action_space.seed(env_seed + 1)
+            if hasattr(env.observation_space, 'seed'):
+                env.observation_space.seed(env_seed + 2)
+            
+            return env
+        return _init
     
     def collect_parallel_batch(
         self, 
         num_steps: int,
         replay_buffer
     ) -> Dict[str, float]:
-        """
-        High-throughput parallel collection with GPU-batched inference
-        
-        Pipeline Architecture:
-        1. Batch observations → GPU inference → actions
-        2. Distribute actions → environment stepping (parallel)
-        3. Collect results → update buffer → repeat
-        """
-        
+        """Main collection loop with improved error handling"""
         steps_collected = 0
         episode_rewards = [0.0] * self.num_envs
         episode_lengths = [0] * self.num_envs
@@ -109,52 +135,154 @@ class GPUCentralizedCollector:
         self.gpu_inference.start()
         
         try:
-            while steps_collected < num_steps:
-                # Batch current observations for GPU inference
-                obs_batch = self._prepare_observation_batch()
+            while steps_collected < num_steps and not self._closing:
+                loop_start = time.time()
                 
-                # Submit to GPU inference (non-blocking)
+                # === GPU PHASE: Batched Inference ===
+                obs_batch = self._prepare_observation_batch(self.current_observations)
+                
+                # Submit to GPU for diffusion + policy inference
                 inference_future = self.gpu_inference.submit_batch(obs_batch)
+                self._pending_futures.append(inference_future)  # Track pending future
                 
-                # Overlap: while GPU computes, prepare next batch or handle results
-                actions_batch = inference_future.get(timeout=300.0)  # GPU inference result
-                
-                # Distribute actions to environment workers
-                step_futures = self._distribute_actions(actions_batch)
-                
-                # Collect environment step results
-                results = self._collect_step_results(step_futures)
-                
-                # Process results and update buffer
-                for env_idx, (obs, action, reward, next_obs, done, info) in enumerate(results):
-                    if obs is not None and action is not None:
-                        replay_buffer.add(obs, action, reward, next_obs, done)
+                # Wait for GPU to complete with timeout handling
+                inference_start = time.time()
+                try:
+                    # Use dynamic timeout based on recent performance
+                    dynamic_timeout = max(60.0, np.mean(self.inference_times[-10:]) * 20) if self.inference_times else 60.0
+                    
+                    # Check if we're closing before waiting
+                    if self._closing:
+                        inference_future.cancel()
+                        break
                         
-                        episode_rewards[env_idx] += reward
-                        episode_lengths[env_idx] += 1
-                        steps_collected += 1
+                    actions_batch = inference_future.get(timeout=dynamic_timeout)
+                    
+                    # Remove from pending futures on success
+                    if inference_future in self._pending_futures:
+                        self._pending_futures.remove(inference_future)
+                    
+                    # Reset consecutive timeout counter on success
+                    self.consecutive_timeouts = 0
+                    
+                except TimeoutError:
+                    # Remove from pending futures
+                    if inference_future in self._pending_futures:
+                        self._pending_futures.remove(inference_future)
                         
-                        if done:
-                            # Episode completed
-                            completed_episodes.append({
-                                'reward': episode_rewards[env_idx],
-                                'length': episode_lengths[env_idx]
-                            })
-                            episode_rewards[env_idx] = 0.0
-                            episode_lengths[env_idx] = 0
-
-                            # Properly handle reset and get new observation
-                            reset_future = self.env_workers[env_idx].reset_async()
-                            # Wait for reset to complete and get new observation
-                            new_obs, reset_info = reset_future.result()
-                            self.current_observations[env_idx] = new_obs
-                        else:
-                            self.current_observations[env_idx] = next_obs
-                        
+                    self.consecutive_timeouts += 1
+                    print(f"Inference timeout #{self.consecutive_timeouts} (timeout: {dynamic_timeout:.1f}s)")
+                    
+                    if self.consecutive_timeouts >= self.max_consecutive_timeouts:
+                        raise RuntimeError(f"Too many consecutive timeouts ({self.consecutive_timeouts})")
+                    
+                    # Use random actions as fallback
+                    print("Using random actions as fallback...")
+                    actions_batch = torch.tensor(
+                        np.array([self.vec_env.action_space.sample() for _ in range(self.num_envs)]),
+                        device=self.device
+                    )
+                
+                inference_time = time.time() - inference_start
+                self.inference_times.append(inference_time)
+                
+                # === CPU PHASE: Parallel Environment Stepping ===
+                actions_np = actions_batch.cpu().numpy()
+                
+                # Validate action shape
+                if actions_np.shape[1:] != self.action_shape:
+                    print(f"Warning: action shape {actions_np.shape[1:]} doesn't match expected {self.action_shape}")
+                    # Reshape or pad as needed
+                    if actions_np.shape[-1] < self.action_shape[0]:
+                        # Pad with zeros
+                        pad_width = [(0, 0)] + [(0, self.action_shape[i] - actions_np.shape[i+1]) for i in range(len(self.action_shape))]
+                        actions_np = np.pad(actions_np, pad_width, mode='constant')
+                    else:
+                        # Truncate
+                        actions_np = actions_np[:, :self.action_shape[0]]
+                
+                # Step all environments in parallel
+                step_start = time.time()
+                step_results = self.vec_env.step(actions_np)
+                next_observations, rewards, terminateds, truncateds, infos = step_results
+                step_time = time.time() - step_start
+                self.step_times.append(step_time)
+                
+                # === Data Processing Phase ===
+                for i in range(self.num_envs):
+                    replay_buffer.add(
+                        self.current_observations[i],
+                        actions_np[i],
+                        rewards[i],
+                        next_observations[i],
+                        terminateds[i] or truncateds[i]
+                    )
+                    
+                    episode_rewards[i] += rewards[i]
+                    episode_lengths[i] += 1
+                    steps_collected += 1
+                    
+                    if terminateds[i] or truncateds[i]:
+                        completed_episodes.append({
+                            'reward': episode_rewards[i],
+                            'length': episode_lengths[i],
+                            'env_id': infos[i].get('env_id', i)
+                        })
+                        episode_rewards[i] = 0.0
+                        episode_lengths[i] = 0
+                
+                # Update observations for next iteration
+                self.current_observations = next_observations
+                
+                # Log performance every 100 steps
+                if steps_collected % 100 == 0:
+                    self._log_performance()
+                
+        except Exception as e:
+            print(f"Error in collection loop: {e}")
+            traceback.print_exc()
+            raise
         finally:
             self.gpu_inference.stop()
+        
+        # Compute final statistics
+        stats = self._compute_statistics(steps_collected, completed_episodes)
+        return stats
+        
+    def _prepare_observation_batch(self, observations: np.ndarray) -> torch.Tensor:
+        """
+        Convert numpy observations to GPU tensor with proper handling
+        
+        The rltoolkit vectorized env already provides a batched array,
+        so we just need to convert it to torch and move to GPU.
+        """
+        # Handle different observation types
+        if isinstance(observations, np.ndarray):
+            # Standard case: numpy array from vectorized env
+            obs_tensor = torch.from_numpy(observations).float()
+        elif isinstance(observations, list):
+            # Edge case: list of observations (shouldn't happen with rltoolkit)
+            obs_tensor = torch.stack([torch.from_numpy(o).float() for o in observations])
+        else:
+            raise TypeError(f"Unexpected observation type: {type(observations)}")
+        
+        # Move to GPU
+        return obs_tensor.to(self.device)
+    
+    def _log_performance(self):
+        """Log performance metrics for monitoring"""
+        if self.inference_times and self.step_times:
+            avg_inference = np.mean(self.inference_times[-10:])
+            avg_step = np.mean(self.step_times[-10:])
+            total_time = avg_inference + avg_step
             
-        # Compute collection statistics
+            print(f"Performance - Inference: {avg_inference:.3f}s, "
+                  f"Step: {avg_step:.3f}s, "
+                  f"FPS: {self.num_envs / total_time:.1f}")
+    
+    def _compute_statistics(self, steps_collected: int, 
+                           completed_episodes: List[Dict]) -> Dict[str, float]:
+        """Compute collection statistics"""
         stats = {
             'steps_collected': steps_collected,
             'episodes_completed': len(completed_episodes)
@@ -162,83 +290,45 @@ class GPUCentralizedCollector:
         
         if completed_episodes:
             rewards = [ep['reward'] for ep in completed_episodes]
+            lengths = [ep['length'] for ep in completed_episodes]
             stats.update({
                 'mean_episode_reward': np.mean(rewards),
                 'std_episode_reward': np.std(rewards),
-                'mean_episode_length': np.mean([ep['length'] for ep in completed_episodes])
+                'mean_episode_length': np.mean(lengths),
+                'min_episode_reward': np.min(rewards),
+                'max_episode_reward': np.max(rewards),
             })
-            
+        
+        if self.inference_times:
+            stats['avg_inference_time'] = np.mean(self.inference_times)
+            stats['inference_fps'] = self.num_envs / stats['avg_inference_time']
+        
         return stats
     
-    def _prepare_observation_batch(self) -> torch.Tensor:
-        """Vectorize observations for batched GPU inference"""
-        obs_list = []
-        for obs in self.current_observations:
-            if obs is not None:
-                if isinstance(obs, np.ndarray):
-                    obs_tensor = torch.from_numpy(obs).float()
-                else:
-                    obs_tensor = obs
-                obs_list.append(obs_tensor)
-            else:
-                # Handle None observations with zeros using stored shape
-                shape = tuple(self.observation_shape) if isinstance(self.observation_shape, np.ndarray) else self.observation_shape
-                obs_list.append(torch.zeros(shape))         
-        return torch.stack(obs_list).to(self.device)
-    
-    def _distribute_actions(self, actions_batch: torch.Tensor) -> List:
-        """Distribute actions to environment workers asynchronously"""
-        actions_cpu = actions_batch.cpu().numpy()
-        futures = []
-        
-        for env_idx, action in enumerate(actions_cpu):
-            future = self.env_workers[env_idx].step_async(action)
-            futures.append((env_idx, future))
-            
-        return futures
-    
-    def _collect_step_results(self, step_futures) -> List[Tuple]:
-        """Collect results from environment workers"""
-        results = []
-        
-        for env_idx, future_dict in step_futures:
-            try:
-                prev_obs = self.current_observations[env_idx]
-                action = future_dict['action']
-                step_result = future_dict['result'].result(timeout=8.0)
-
-                if len(step_result) == 5:
-                    next_obs, reward, terminated, truncated, info = step_result
-                    done = terminated or truncated
-                else:
-                    # Fallback for older Gym versions
-                    next_obs, reward, done, info = step_result
-                
-                results.append((prev_obs, action, reward, next_obs, done, info))
-                
-            except Exception as e:
-                print(f"Environment {env_idx} step failed: {e}")
-                results.append((None, None, 0.0, None, True, {}))
-                
-        return results
-    
     def close(self):
-        """Clean up with proper resource ordering"""
+        """Clean up resources"""
         print("Closing GPU collector...")
-        # 1. First stop GPU inference
+        
+        # Set closing flag to stop collection loop
+        self._closing = True
+        
+        # Cancel all pending futures
+        for future in self._pending_futures:
+            try:
+                future.cancel()
+            except:
+                pass
+        self._pending_futures.clear()
+        
+        # Stop GPU inference first
         if hasattr(self, 'gpu_inference'):
             self.gpu_inference.stop()
         
-        # 2. Close environment workers
-        for worker in self.env_workers:
-            try:
-                worker.close()
-            except Exception as e:
-                print(f"Error closing worker: {e}")
+        # Close vectorized environments
+        if hasattr(self, 'vec_env'):
+            self.vec_env.close()
         
-        # 3. Explicitly clear references
-        self.env_workers = []
-        self.current_observations = []
+        print("GPU collector closed successfully")
 
 class AsyncGPUInference:
     """
@@ -273,7 +363,7 @@ class AsyncGPUInference:
         # Threading infrastructure
         self.inference_queue = Queue(maxsize=max_queue_size)
         self.result_queue = Queue(maxsize=max_queue_size)
-        self.shutdown_event = mp.Event()
+        self.shutdown_event = Event()
         
         # CUDA optimization
         self.inference_stream = torch.cuda.Stream()
@@ -282,19 +372,39 @@ class AsyncGPUInference:
         # Performance monitoring
         self.inference_times = []
         self.batch_sizes = []
-        self.done =True
+        self.error_count = 0
+        self.max_errors = 10
+        
+        # Thread reference
+        self.gpu_thread = None
         
     def start(self):
         """Initialize GPU inference worker thread"""
+        if self.gpu_thread is not None and self.gpu_thread.is_alive():
+            print("GPU inference thread already running")
+            return
+            
+        self.shutdown_event.clear()
         self.gpu_thread = Thread(target=self._gpu_inference_worker, daemon=True)
         self.gpu_thread.start()
         
     def stop(self):
         """Gracefully shutdown inference pipeline"""
+        if self.gpu_thread is None:
+            return
+            
         self.shutdown_event.set()
-        self.inference_queue.put(None)  # Sentinel
-        if hasattr(self, 'gpu_thread'):
-            self.gpu_thread.join(timeout=10.0)
+        
+        # Send sentinel to wake up thread if it's waiting
+        try:
+            self.inference_queue.put(None, timeout=1.0)
+        except Full:
+            pass
+            
+        if self.gpu_thread.is_alive():
+            self.gpu_thread.join(timeout=5.0)
+            if self.gpu_thread.is_alive():
+                print("Warning: GPU inference thread did not shut down cleanly")
     
     def submit_batch(self, observations_batch: torch.Tensor) -> 'InferenceFuture':
         """Submit observation batch for GPU inference"""
@@ -304,6 +414,7 @@ class AsyncGPUInference:
             self.inference_queue.put((observations_batch, future), timeout=1.0)
         except:
             # Queue full - return dummy actions
+            print("Inference queue full, returning dummy actions")
             dummy_actions = torch.zeros(observations_batch.shape[0], self.action_dim)
             future.set_result(dummy_actions)
             
@@ -311,35 +422,67 @@ class AsyncGPUInference:
     
     def _gpu_inference_worker(self):
         """Dedicated GPU worker for continuous inference processing"""
-        torch.cuda.set_device(0)  # Ensure GPU context
+        if torch.cuda.is_available():
+            torch.cuda.set_device(0)  # Ensure GPU context
+        print("Starting GPU inference worker thread")
         
-        with torch.cuda.stream(self.inference_stream):
-            while not self.shutdown_event.is_set():
+        while not self.shutdown_event.is_set():
+            try:
+                # Get next batch with timeout
                 try:
                     batch_item = self.inference_queue.get(timeout=0.1)
-                    if batch_item is None:  # Shutdown sentinel
-                        break
-                        
-                    observations_batch, future = batch_item
-                    start_time = time.time()
+                except Empty:
+                    continue
                     
+                if batch_item is None:  # Shutdown sentinel
+                    break
+                    
+                observations_batch, future = batch_item
+                
+                # Skip if future already cancelled
+                if hasattr(future, 'cancelled') and future.cancelled:
+                    continue
+                
+                start_time = time.time()
+                
+                try:
                     # Execute batched diffusion inference on GPU
-                    actions_batch = self._batched_diffusion_inference(observations_batch)
+                    if torch.cuda.is_available():
+                        with torch.cuda.stream(self.inference_stream):
+                            actions_batch = self._batched_diffusion_inference(observations_batch)
+                    else:
+                        actions_batch = self._batched_diffusion_inference(observations_batch)
                     
                     # Performance tracking
                     inference_time = time.time() - start_time
                     self.inference_times.append(inference_time)
                     self.batch_sizes.append(observations_batch.shape[0])
                     
+                    # Reset error count on success
+                    self.error_count = 0
+                    
+                    # Set result
                     future.set_result(actions_batch)
                     
-                except Empty:
-                    continue
                 except Exception as e:
-                    print(f"GPU inference error: {e}")
-                    if 'future' in locals():
-                        future.set_error(e)
-    
+                    self.error_count += 1
+                    print(f"GPU inference error #{self.error_count}: {e}")
+                    traceback.print_exc()
+                    
+                    if self.error_count >= self.max_errors:
+                        print(f"Too many errors ({self.error_count}), shutting down GPU worker")
+                        future.set_error(RuntimeError(f"GPU worker failed after {self.error_count} errors"))
+                        break
+                    
+                    # Set error on future
+                    future.set_error(e)
+                    
+            except Exception as e:
+                print(f"Unexpected error in GPU worker: {e}")
+                traceback.print_exc()
+                
+        print("GPU inference worker stopped")
+        
     def _batched_diffusion_inference(self, observations_batch: torch.Tensor) -> torch.Tensor:
         """
         Vectorized diffusion inference across entire observation batch
@@ -347,18 +490,21 @@ class AsyncGPUInference:
         """
         batch_size = observations_batch.shape[0]
         
-        with torch.no_grad():
-            # Mixed precision context for memory efficiency
-            if self.use_mixed_precision:
-                with torch.amp.autocast(
-                    device_type='cuda',
-                    dtype=torch.float16):  # Use fp16 for mixed precision
+        try:
+            with torch.no_grad():
+                if self.use_mixed_precision and torch.cuda.is_available():
+                    with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                        actions_batch = self._inference_impl(observations_batch, batch_size)
+                else:
                     actions_batch = self._inference_impl(observations_batch, batch_size)
-            else:
-                actions_batch = self._inference_impl(observations_batch, batch_size)
-                
-        return actions_batch.float()  # Ensure fp32 output
-    
+                    
+            return actions_batch.float()
+            
+        except Exception as e:
+            print(f"Error in batched diffusion inference: {e}")
+            # Return random actions as fallback
+            return torch.randn(batch_size, self.action_dim, device=observations_batch.device) * 0.1
+     
     def _inference_impl(self, observations_batch: torch.Tensor, batch_size: int) -> torch.Tensor:
         """Implementation of inference logic"""
         # Encode observations (if pixel-based)
@@ -390,7 +536,6 @@ class AsyncGPUInference:
         Optimized batched reverse diffusion with reduced steps
         Implements parallel sampling across batch dimension
         """
-        self.timeout = max(10, num_steps * 0.5)
         batch_size = observations_batch.shape[0]
         latent_dim = self.agent.config.latent_dim
         if num_steps is None:
@@ -443,6 +588,9 @@ class AsyncGPUInference:
             z_batch = self.agent.active_inference.latent_diffusion.p_sample(
                 z_batch, t_batch_long, score_batch, deterministic=False
             )
+            if torch.isnan(z_batch).any() or torch.isinf(z_batch).any():
+                print(f"NaN/Inf detected at diffusion step {step}, reinitializing")
+                z_batch = torch.randn_like(z_batch) * 0.1
         
         return z_batch
 
@@ -453,18 +601,28 @@ class InferenceFuture:
     def __init__(self):
         self.result = None
         self.error = None
-        self.ready = mp.Event()
-    
+        self.ready = Event()
+        self.cancelled = False  # Track cancellation state
+
     def set_result(self, result):
-        self.result = result
-        self.ready.set()
+        if not self.cancelled:
+            self.result = result
+            self.ready.set()
     
     def set_error(self, error):
-        self.error = error
+        if not self.cancelled:
+            self.error = error
+            self.ready.set()
+
+    def cancel(self):
+        """Mark this future as cancelled"""
+        self.cancelled = True
         self.ready.set()
     
     def get(self, timeout=None):
         if self.ready.wait(timeout):
+            if self.cancelled:
+                raise RuntimeError("Inference was cancelled")
             if self.error:
                 raise self.error
             return self.result
@@ -486,7 +644,8 @@ class EnvironmentWorker:
         """Initialize worker with dedicated thread pool"""
         from concurrent.futures import ThreadPoolExecutor
         self.executor = ThreadPoolExecutor(max_workers=2,  # Increased from 1 for better parallelism
-                                         thread_name_prefix=f'env-{self.worker_id}')
+                                         thread_name_prefix=f'env-{self.worker_id}',
+                                         mp_context=mp.get_context('spawn'))
         self.env = self.env_fn()
         self.env.reset(seed=self.seed)
     

@@ -217,7 +217,7 @@ def train_diffusion_active_inference(
         )
         
         # Override diffusion steps for faster collection
-        collector.gpu_inference.max_diffusion_steps = 30  # Reduced from 40
+        collector.gpu_inference.max_diffusion_steps = 20  # Reduced from 40
         
     else:
         # Fallback to CPU-based parallel collector

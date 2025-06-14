@@ -75,7 +75,7 @@ class ReplayBuffer:
             
         self.actions[self.pos] = torch.from_numpy(action)
         self.rewards[self.pos] = reward
-        self.dones[self.pos] = done
+        self.dones[self.pos] = bool(done)
         
         self.pos = (self.pos + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
