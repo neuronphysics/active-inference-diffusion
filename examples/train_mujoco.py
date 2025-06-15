@@ -33,6 +33,7 @@ from active_inference_diffusion.utils.async_collector import GPUCentralizedColle
 from active_inference_diffusion.utils.util import visualize_reconstruction
 import os
 
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True,max_split_size_mb:512'
 os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
 os.environ['MUJOCO_GL'] = 'egl'
 
@@ -148,10 +149,10 @@ def train_diffusion_active_inference(
     # Create configurations
     config = ActiveInferenceConfig(
         env_name=env_name,
-        latent_dim=50,
-        hidden_dim=256,
+        latent_dim=32,
+        hidden_dim=128,
         learning_rate=5e-5,
-        batch_size=2048,
+        batch_size=64,
         efe_horizon=5,
         epistemic_weight=0.1,
         pragmatic_weight=1.0,
@@ -170,7 +171,7 @@ def train_diffusion_active_inference(
         beta_end=0.02
     )
     
-    buffer_size = 100_000 if not use_pixels else 50_000
+    buffer_size = 100_000 if not use_pixels else 15_000
     training_config = TrainingConfig(
         total_timesteps=total_timesteps,
         eval_frequency=10_000,
@@ -178,7 +179,7 @@ def train_diffusion_active_inference(
         log_frequency=1_000,
         buffer_size=buffer_size,
         learning_starts=5_000,
-        gradient_steps=4,
+        gradient_steps=2,
         exploration_noise=0.1,
         exploration_decay=0.999,
         num_parallel_envs=num_parallel_envs
@@ -449,7 +450,7 @@ if __name__ == "__main__":
     parser.add_argument('--timesteps', type=int, default=1_000_000)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--num_parallel_envs', type=int, default=4,
+    parser.add_argument('--num_parallel_envs', type=int, default=3,
                         help='Number of parallel environments for data collection')
     parser.add_argument('--no_gpu_collector', action='store_true',
                         help='Disable GPU-optimized collector (use CPU parallel collector)')

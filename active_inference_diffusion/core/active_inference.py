@@ -155,6 +155,7 @@ class DiffusionActiveInference(nn.Module):
             latent_dim=self.latent_dim,
             observation_shape=observation_shape,
             hidden_dim=self.config.hidden_dim,
+            spatial_aggregator_output_dim=self.config.spatial_aggregator_output_dim,
             is_pixel_observation=self.is_pixel_observation,
             device=self.device
             )
@@ -847,6 +848,7 @@ class FunctionSpaceEpistemicEstimator(nn.Module):
         latent_dim: int,
         observation_shape: Union[int,Tuple[int, int, int]],
         hidden_dim: int = 256,
+        spatial_aggregator_output_dim: int = 256,
         is_pixel_observation: bool = True,
         device: Union[str, torch.device] = 'cuda'
     ):
@@ -878,7 +880,7 @@ class FunctionSpaceEpistemicEstimator(nn.Module):
                 spatial_dim=21  # After 3 stride-2 convolutions from 84x84
             )
             # Jacobian feature projection
-            jacobian_dim = hidden_dim * self.ntk_samples  # 128 channels, 2 spatial dimensions (H, W)
+            jacobian_dim = spatial_aggregator_output_dim * self.ntk_samples  # 128 channels, 2 spatial dimensions (H, W)
         else:
             self.state_dim = observation_shape
             self.feature_extractor = nn.Sequential(
@@ -907,7 +909,7 @@ class FunctionSpaceEpistemicEstimator(nn.Module):
         
         # MINE statistics network
         self.mine_network = nn.Sequential(
-            nn.Linear(hidden_dim + 128, 512),
+            nn.Linear(spatial_aggregator_output_dim + 128, 512),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(512, 512),

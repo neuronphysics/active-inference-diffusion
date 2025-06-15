@@ -59,6 +59,7 @@ class ActiveInferenceConfig:
     # Model architecture
     hidden_dim: int = 512
     latent_dim: int = 128
+    spatial_aggregator_output_dim:int = 256
     num_layers: int = 3
     pixel_observation: bool = False  # Use pixel observations
     # Training
