@@ -159,10 +159,7 @@ class DiffusionActiveInference(nn.Module):
             is_pixel_observation=self.is_pixel_observation,
             device=self.device
             )
-        self.epistemic_optimizer = torch.optim.Adam(
-            self.epistemic_estimator.parameters(),
-            lr=self.config.epistemic_lr if hasattr(self.config, "epistemic_lr") else 1e-4
-        )
+    
 
         # Initialize a reward predictor
         self.reward_predictor = nn.Sequential(
