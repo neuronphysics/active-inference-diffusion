@@ -50,6 +50,9 @@ class GPUCentralizedCollector:
         if hasattr(agent, 'active_inference'):
             agent.active_inference = agent.active_inference.to(self.device)
             agent.active_inference.eval()
+        
+        if hasattr(agent, 'epistemic_optimizer') and not hasattr(agent.active_inference, 'epistemic_optimizer'):
+                agent.active_inference.epistemic_optimizer = agent.epistemic_optimizer
             
         if hasattr(agent, 'encoder'):
             agent.encoder = agent.encoder.to(self.device)

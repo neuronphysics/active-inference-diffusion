@@ -272,3 +272,17 @@ class DiffusionStateAgent(BaseActiveInferenceAgent):
             list(self.active_inference.reward_predictor.parameters()),
             lr=self.config.learning_rate
         )
+        # Add epistemic optimizer
+        self.epistemic_optimizer = torch.optim.AdamW(
+            self.active_inference.epistemic_estimator.parameters(),
+            lr=self.config.learning_rate*0.1,
+            weight_decay=1e-5,
+            betas=(0.9, 0.999)
+        )
+        self.active_inference.epistemic_optimizer = self.epistemic_optimizer
+
+        # Score network optimizer
+        self.score_optimizer = torch.optim.Adam(
+            self.active_inference.latent_score_network.parameters(),
+            lr=self.config.learning_rate
+        )
