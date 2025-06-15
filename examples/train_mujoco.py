@@ -165,7 +165,7 @@ def train_diffusion_active_inference(
     
     # Enhanced diffusion config
     config.diffusion = DiffusionConfig(
-        num_diffusion_steps=25,  # Can be reduced to 10 for GPU collector
+        num_diffusion_steps=25,  # TODO: Adjust based on performance
         beta_schedule="cosine",
         beta_start=1e-4,
         beta_end=0.02

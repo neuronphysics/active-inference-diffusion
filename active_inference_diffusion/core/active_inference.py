@@ -159,6 +159,7 @@ class DiffusionActiveInference(nn.Module):
             is_pixel_observation=self.is_pixel_observation,
             device=self.device
             )
+    
 
         # Initialize a reward predictor
         self.reward_predictor = nn.Sequential(
