@@ -31,12 +31,31 @@ from active_inference_diffusion.envs.pixel_wrappers import make_pixel_mujoco
 # Use GPU-optimized collector instead of regular parallel collector
 from active_inference_diffusion.utils.async_collector import GPUCentralizedCollector
 from active_inference_diffusion.utils.util import visualize_reconstruction
+import torch.profiler
+
 import os
 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True,max_split_size_mb:512'
 os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
 os.environ['MUJOCO_GL'] = 'egl'
 
+
+def profile_training_step(agent, batch_data, step):
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True
+    ) as prof:
+        with torch.profiler.record_function("training_step"):
+            metrics = agent.train_step()
+    
+    if step % 100 == 0:
+        print(prof.key_averages().table(sort_by="cuda_memory_usage", row_limit=10))
+        prof.export_chrome_trace(f"trace_step_{step}.json")
 
 def setup_environment(
     env_name: str,
@@ -149,10 +168,10 @@ def train_diffusion_active_inference(
     # Create configurations
     config = ActiveInferenceConfig(
         env_name=env_name,
-        latent_dim=32,
-        hidden_dim=128,
-        learning_rate=5e-5,
-        batch_size=64,
+        latent_dim=64,
+        hidden_dim=32,
+        learning_rate=8e-5,
+        batch_size=128,
         efe_horizon=5,
         epistemic_weight=0.1,
         pragmatic_weight=1.0,
@@ -165,7 +184,7 @@ def train_diffusion_active_inference(
     
     # Enhanced diffusion config
     config.diffusion = DiffusionConfig(
-        num_diffusion_steps=25,  # TODO: Adjust based on performance
+        num_diffusion_steps=200,  # TODO: Adjust based on performance
         beta_schedule="cosine",
         beta_start=1e-4,
         beta_end=0.02
@@ -179,7 +198,7 @@ def train_diffusion_active_inference(
         log_frequency=1_000,
         buffer_size=buffer_size,
         learning_starts=5_000,
-        gradient_steps=2,
+        gradient_steps=4,
         exploration_noise=0.1,
         exploration_decay=0.999,
         num_parallel_envs=num_parallel_envs
@@ -329,7 +348,7 @@ def train_diffusion_active_inference(
                 training_start = time.time()
                 
                 # Perform gradient updates
-                num_updates = int(training_config.gradient_steps * collection_stats['steps_collected'])
+                num_updates = training_config.gradient_steps 
                 
                 train_metrics = {}
                 for _ in range(num_updates):
@@ -340,7 +359,14 @@ def train_diffusion_active_inference(
                         train_metrics[k].append(v)
                 
                 # Average training metrics
-                avg_train_metrics = {k: np.mean(v) for k, v in train_metrics.items()}
+                avg_train_metrics = {}
+                for k, v in train_metrics.items():
+                    if isinstance(v[0], torch.Tensor):
+                        # Handle torch tensors (move to CPU first)
+                        avg_train_metrics[k] = torch.stack(v).mean().cpu().item()
+                    else:
+                        # Handle regular numbers
+                        avg_train_metrics[k] = np.mean(v)
                 
                 training_time = time.time() - training_start
                 avg_train_metrics['training/time'] = training_time
