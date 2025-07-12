@@ -140,7 +140,7 @@ class GPUCentralizedCollector:
         try:
             while steps_collected < num_steps and not self._closing:
                 loop_start = time.time()
-                
+                self._cleanup_futures()  # Clean up completed futures
                 # === GPU PHASE: Batched Inference ===
                 obs_batch = self._prepare_observation_batch(self.current_observations)
                 
@@ -240,18 +240,35 @@ class GPUCentralizedCollector:
                 # Log performance every 100 steps
                 if steps_collected % 100 == 0:
                     self._log_performance()
+                if steps_collected % 1000 == 0:
+                    print(f"Collected {steps_collected} steps in {time.time() - loop_start:.2f}s")
+                    torch.cuda.empty_cache()  # Clear GPU memory to avoid fragmentation
                 
         except Exception as e:
             print(f"Error in collection loop: {e}")
             traceback.print_exc()
             raise
         finally:
+            self._cleanup_all_futures()  # Ensure all futures are cleaned up
             self.gpu_inference.stop()
         
         # Compute final statistics
-        stats = self._compute_statistics(steps_collected, completed_episodes)
-        return stats
+        return self._compute_statistics(steps_collected, completed_episodes)
         
+    def _cleanup_futures(self):
+        """Remove completed futures from tracking list"""
+        self._pending_futures = [f for f in self._pending_futures 
+                                if not f.ready.is_set()]
+
+    def _cleanup_all_futures(self):
+        """Cancel and remove all pending futures"""
+        for future in self._pending_futures:
+            try:
+                future.cancel()
+            except:
+                pass
+        self._pending_futures.clear()
+
     def _prepare_observation_batch(self, observations: np.ndarray) -> torch.Tensor:
         """
         Convert numpy observations to GPU tensor with proper handling
@@ -367,7 +384,10 @@ class AsyncGPUInference:
         self.inference_queue = Queue(maxsize=max_queue_size)
         self.result_queue = Queue(maxsize=max_queue_size)
         self.shutdown_event = Event()
-        
+        self.inference_steps = agent.config.diffusion.inference_steps
+        self.ddim_eta = agent.config.diffusion.ddim_eta
+        self.use_ddim = (self.inference_steps is not None and 
+                 self.inference_steps < agent.config.diffusion.num_diffusion_steps)
         # CUDA optimization
         self.inference_stream = torch.cuda.Stream()
         self.scaler = torch.cuda.amp.GradScaler() if use_mixed_precision else None
@@ -519,7 +539,9 @@ class AsyncGPUInference:
         # Batched belief generation via reverse diffusion
         latents_batch = self._batch_diffusion_sampling(
             encoded_obs, 
-            num_steps=self.max_diffusion_steps
+            num_steps=self.inference_steps if self.use_ddim else self.max_diffusion_steps,
+            use_ddim=self.use_ddim,
+            eta=self.ddim_eta
         )
         
         # Batched policy evaluation
@@ -533,7 +555,9 @@ class AsyncGPUInference:
     def _batch_diffusion_sampling(
         self, 
         observations_batch: torch.Tensor,
-        num_steps: Optional[int] = None
+        num_steps: Optional[int] = None,
+        use_ddim: bool = False,
+        eta: float = 0.0
     ) -> torch.Tensor:
         """
         Optimized batched reverse diffusion with reduced steps
@@ -578,23 +602,21 @@ class AsyncGPUInference:
             if hasattr(self.agent.active_inference.latent_diffusion, 'continuous_time') and \
                self.agent.active_inference.latent_diffusion.continuous_time:
                 t_continuous = t_batch.float() / max_index
-                score_batch = self.agent.active_inference.latent_score_network(
-                    z_batch, t_continuous, observations_batch
-                )
+                with torch.no_grad():
+                    score_batch = self.agent.active_inference.latent_score_network(z_batch.detach(), t_continuous, observations_batch)
             else:
                 # Use clamped long indices for discrete time
-                score_batch = self.agent.active_inference.latent_score_network(
-                    z_batch, t_batch_long.float(), observations_batch
-                )
-            
+                with torch.no_grad():
+                    score_batch = self.agent.active_inference.latent_score_network(z_batch.detach(), t_batch_long.float(), observations_batch)
+
             # Use clamped long indices for diffusion update
-            z_batch = self.agent.active_inference.latent_diffusion.p_sample(
-                z_batch, t_batch_long, score_batch, deterministic=False
-            )
+            z_batch = self.agent.active_inference.latent_diffusion.p_sample(z_batch.detach(), t_batch_long, score_batch, deterministic=False)
+            z_batch = z_batch.detach()  # Detach to avoid gradients accumulating
             if torch.isnan(z_batch).any() or torch.isinf(z_batch).any():
                 print(f"NaN/Inf detected at diffusion step {step}, reinitializing")
-                z_batch = torch.randn_like(z_batch) * 0.1
-        
+                z_batch = torch.randn_like(z_batch, device=z_batch.device) * 0.1
+            del score_batch  # Free memory
+            torch.cuda.empty_cache()  # Clear cache to avoid fragmentation
         return z_batch
 
 

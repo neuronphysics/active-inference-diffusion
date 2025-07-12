@@ -135,7 +135,8 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
             # Use diffusion active inference with encoded features
             action_tensor, info = self.active_inference.act(
                 encoded_obs.squeeze(0),  # Remove batch dimension
-                deterministic=deterministic
+                deterministic=deterministic,
+                raw_observation=obs_tensor
             )
             
         # Convert to numpy
@@ -165,6 +166,13 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
         
     def encode_observation(self, observation: torch.Tensor) -> torch.Tensor:
         """Encode pixel observation to feature space with augmentation"""
+        if observation.device != next(self.encoder.parameters()).device:
+            observation = observation.to(next(self.encoder.parameters()).device)
+    
+        # If observation is uint8, normalize to [0, 1]
+        if observation.dtype == torch.uint8:
+            observation = observation.float() / 255.0
+ 
         # Apply augmentation during training
         # Handle different input formats
         if observation.ndim == 5:  # (batch, frame_stack, C, H, W)
@@ -302,8 +310,10 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
         # 2. Generate latents via diffusion
         with torch.no_grad():
             belief_info = self.active_inference.update_belief_via_diffusion(encoded_obs)
+            latents_mean = belief_info['latent_mean']
+            latents_std = belief_info['latent_std']
             latents = belief_info['latent']
-            
+
             next_belief_info = self.active_inference.update_belief_via_diffusion(encoded_next_obs)
             next_latents = next_belief_info['latent']
         torch.nn.utils.clip_grad_norm_(self.active_inference.latent_score_network.parameters(),
@@ -311,18 +321,20 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
         # 3. Train diffusion components
         self.score_optimizer.zero_grad()
         elbo_loss, elbo_info = self.active_inference.compute_diffusion_elbo(
-            encoded_obs, normalized_rewards, latents
+            encoded_obs, 
+            normalized_rewards, 
+            raw_observations=obs
         )
-        
+
         # 4. Add contrastive representation loss
         contrastive_loss = self.compute_representation_loss(
             encoded_obs, encoded_next_obs, actions, latents, next_latents
         )
-        
+
         # Combined loss
         total_loss = elbo_loss + self.config.contrastive_weight * contrastive_loss
         total_loss.backward()
-        
+
         torch.nn.utils.clip_grad_norm_(
             list(self.active_inference.latent_score_network.parameters()) +
             list(self.active_inference.latent_diffusion.parameters()) +
@@ -334,7 +346,8 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
         
         metrics.update(elbo_info)
         metrics['contrastive_loss'] = contrastive_loss.item()
-        
+        metrics['total_loss'] = total_loss.item()
+
         # 5. Train policy network
         self.policy_optimizer.zero_grad()
         
@@ -439,11 +452,19 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
     def _setup_optimizers(self):
         """Setup optimizers including visual components"""
         # Score network optimizer (includes encoder)
+        decoder_params = []
+        if isinstance(self.active_inference.observation_decoder, nn.ModuleList):
+            for module in self.active_inference.observation_decoder:
+                decoder_params.extend(list(module.parameters()))
+        else:
+            decoder_params = list(self.active_inference.observation_decoder.parameters())
+
         self.score_optimizer = torch.optim.AdamW(
             list(self.active_inference.latent_score_network.parameters()) +
             list(self.active_inference.latent_diffusion.parameters()) +
             list(self.encoder.parameters())+
-            list(self.active_inference.feature_decoder.parameters()),
+            list(self.active_inference.feature_decoder.parameters())+
+            decoder_params,
             lr=self.config.learning_rate,
             weight_decay=1e-5
         )

@@ -254,6 +254,7 @@ class ConvDecoder(nn.Module):
         self.spatial_size = spatial_size
         self.img_channels = img_channels
         self.device = device
+        self.hidden_dim = hidden_dim
         
         # Initial projection with careful initialization
         self.latent_proj = nn.Sequential(
@@ -289,7 +290,7 @@ class ConvDecoder(nn.Module):
             )
         )
         
-        # Block 3: Refine at 42x42
+        # Block 3: Refine at 42x42 -> 84x84
         self.decoder_blocks.append(
             DecoderBlock(
                 in_channels=hidden_dim // 2,
@@ -299,21 +300,10 @@ class ConvDecoder(nn.Module):
             )
         )
         
-        # Block 4: Upsample 42x42 -> 84x84
-        self.decoder_blocks.append(
-            DecoderBlock(
-                in_channels=hidden_dim // 4,
-                out_channels=hidden_dim // 8,
-                upsample=True,
-                use_spectral_norm=use_spectral_norm
-            )
-        )
-        
-
         
         # Output projection with multiple conv layers for refinement
         self.output_proj = nn.Sequential(
-            nn.Conv2d(hidden_dim // 8, 32, kernel_size=3, padding=1),
+            nn.Conv2d(hidden_dim // 4, 32, kernel_size=3, padding=1),
             nn.InstanceNorm2d(32),
             nn.Mish(),
             nn.Conv2d(32, 32, kernel_size=3, padding=1),
@@ -355,8 +345,8 @@ class ConvDecoder(nn.Module):
         
         # Project latent to spatial representation
         h = self.latent_proj(latent)
-        h = h.view(batch_size, -1, self.spatial_size, self.spatial_size)
-        
+        h = h.view(batch_size, self.hidden_dim, self.spatial_size, self.spatial_size)
+
         # Progressive decoding with feature refinement
         for block in self.decoder_blocks:
             h = block(h)

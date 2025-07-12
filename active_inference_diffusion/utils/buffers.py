@@ -28,7 +28,9 @@ class ReplayBuffer:
         self.obs_shape = obs_shape
         self.pos = 0
         self.size = 0
-        
+        self.cleanup_count = 0
+        self.cleanup_interval = 2000  # Cleanup every 2000 additions
+
         # Allocate memory
         if optimize_memory and len(obs_shape) == 3:  # Pixel observations
             self.observations = [None] * capacity
@@ -79,6 +81,14 @@ class ReplayBuffer:
         
         self.pos = (self.pos + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
+        self.cleanup_count += 1
+        if self.compress and self.cleanup_count >= self.cleanup_interval:
+            # Perform cleanup to free memory
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            self.cleanup_count = 0
         
     def sample(self, batch_size: int) -> Dict[str, torch.Tensor]:
         """Sample batch of transitions"""

@@ -135,7 +135,8 @@ class DiffusionStateAgent(BaseActiveInferenceAgent):
         with torch.no_grad():
             belief_info = self.active_inference.update_belief_via_diffusion(observations)
             latents = belief_info['latent']
-            
+            latents_std = belief_info['latent_std']
+            latents_mean = belief_info['latent_mean']       
             next_belief_info = self.active_inference.update_belief_via_diffusion(next_observations)
             next_latents = next_belief_info['latent']
         
@@ -146,7 +147,7 @@ class DiffusionStateAgent(BaseActiveInferenceAgent):
         )  # Clip gradients of score network
         self.score_optimizer.zero_grad()
         elbo_loss, elbo_info = self.active_inference.compute_diffusion_elbo(
-            observations, normalized_rewards, latents
+            observations, normalized_rewards, latents_mean, latents_std
         )
         elbo_loss.backward()
         torch.nn.utils.clip_grad_norm_(

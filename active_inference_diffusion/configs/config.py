@@ -10,7 +10,7 @@ import torch
 @dataclass
 class DiffusionConfig:
     """Configuration for diffusion process"""
-    num_diffusion_steps: int = 1000
+    num_diffusion_steps: int = 200
     beta_start: float = 1e-4
     beta_end: float = 0.02
     beta_schedule: str = "cosine"  # Options: "cosine", "linear"
@@ -20,6 +20,8 @@ class DiffusionConfig:
     time_annealing_end: float = 0.1
     annealing_steps: int = 100000
     gradient_clip_val: float = 0.1
+    inference_steps: Optional[int] = 100  # None means use DDPM
+    ddim_eta: float = 0.3  # Eta for DDIM, 0.0 means deterministic
     
 @dataclass
 class BeliefDynamicsConfig:
