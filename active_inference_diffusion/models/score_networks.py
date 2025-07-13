@@ -41,7 +41,7 @@ class LatentScoreNetwork(nn.Module):
         self.time_embed = nn.Sequential(
             SinusoidalPositionEmbeddings(time_embed_dim),
             nn.Linear(time_embed_dim, hidden_dim*2),  # Changed to output hidden_dim directly
-            nn.SiLU(),
+            nn.ReLU(),
             nn.Linear(hidden_dim*2, hidden_dim)
         )
         
@@ -49,18 +49,21 @@ class LatentScoreNetwork(nn.Module):
         self.obs_encoder = nn.Sequential(
             nn.Linear(observation_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
+            nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
+            nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
         )
         self.continuous_time_embed = nn.Sequential(
-            nn.Linear(1, time_embed_dim),
+            nn.Linear(1, time_embed_dim, bias=True),
+            nn.LayerNorm(time_embed_dim),
             nn.SiLU(),
             nn.Linear(time_embed_dim, time_embed_dim),
+            nn.LayerNorm(time_embed_dim),
             nn.SiLU(),
             nn.Linear(time_embed_dim, hidden_dim)
         )
@@ -91,13 +94,23 @@ class LatentScoreNetwork(nn.Module):
         self.norm_final = AdaptiveLayerNorm(hidden_dim)
         self.output_proj = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.SiLU(),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU(),
             nn.Linear(hidden_dim // 2, latent_dim, bias=False)
         )
         self.output_multiplier = nn.Parameter(torch.ones(1) * output_scale)
         # Initialize output to zero for stability
-        nn.init.zeros_(self.output_proj[-1].weight)
-        
+        self.apply(self.init_weights)
+
+    def init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            # Use smaller initialization for pixel observations
+            nn.init.xavier_uniform_(m.weight, gain=1.0)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+    
+    
+
     def forward(
         self,
         z_t: torch.Tensor,
@@ -128,21 +141,23 @@ class LatentScoreNetwork(nn.Module):
         
             # Also use continuous embedding
             normalized_time = 2.0 * time.view(-1, 1) - 1.0  # [-1, 1]
+            normalized_time = torch.clamp(normalized_time, -1.0, 1.0)  # Ensure within bounds
             t_cont = self.continuous_time_embed(normalized_time)
         
             # Combine both with learned weighting
             t_emb = t_sin + self.time_scale * t_cont
         
             # Add time-dependent output scaling for annealing
-            time_weight = torch.sqrt(1.0 / (1e-5 + time.view(-1, 1)))
+            time_weight = torch.sqrt(torch.clamp(1.0 / (torch.finfo(torch.float16).eps + time.view(-1, 1)), max=10.0))
         else:
             # Discrete time path (for backward compatibility)
-            t_emb = self.time_embed(time)
+            t_emb = self.time_embed(time.float())
             time_weight = 1.0
 
         # Encode observation
         if observation is not None:
             obs_emb = self.obs_encoder(observation)
+            obs_emb = F.normalize(obs_emb, dim=-1)
         else:
             # Use learned null embedding
             obs_emb = torch.zeros(batch_size, self.obs_encoder[-1].out_features, 
@@ -163,7 +178,7 @@ class LatentScoreNetwork(nn.Module):
         # Final norm and output
         h = self.norm_final(h, conditioning)
         score = self.output_proj(h)
-        score = torch.clamp(score, min=-10, max=10)
+        score = torch.clamp(score, min=-2, max=2)
         score = score * self.output_multiplier  # Scale output
         if is_continuous:
             # Apply time-dependent scaling for continuous time
@@ -197,6 +212,7 @@ class DiTBlock(nn.Module):
         mlp_hidden_dim = int(hidden_dim * mlp_ratio)
         self.mlp = nn.Sequential(
             nn.Linear(hidden_dim, mlp_hidden_dim),
+            nn.LayerNorm(mlp_hidden_dim),
             nn.GELU(),
             nn.Linear(mlp_hidden_dim, hidden_dim)
         )
@@ -207,9 +223,9 @@ class DiTBlock(nn.Module):
     def _init_weights(self):
         # Initialize MLP
         nn.init.xavier_uniform_(self.mlp[0].weight)
-        nn.init.xavier_uniform_(self.mlp[2].weight)
+        nn.init.xavier_uniform_(self.mlp[3].weight)
         nn.init.zeros_(self.mlp[0].bias)
-        nn.init.zeros_(self.mlp[2].bias)
+        nn.init.zeros_(self.mlp[3].bias)
         
     def forward(self, x: torch.Tensor, conditioning: torch.Tensor) -> torch.Tensor:
         """
@@ -247,7 +263,7 @@ class AdaptiveLayerNorm(nn.Module):
         # Projection for adaptive parameters
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(hidden_dim, 2 * hidden_dim)
+            nn.Linear(hidden_dim, 2 * hidden_dim),
         )
         
         # Initialize modulation to identity

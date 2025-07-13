@@ -308,6 +308,8 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
                 dtype=torch.float32
                 )
         # 2. Generate latents via diffusion
+        if torch.isnan(encoded_obs).any() or torch.isinf(encoded_obs).any():
+            raise ValueError("Encoded observation contains NaN or Inf values")
         with torch.no_grad():
             belief_info = self.active_inference.update_belief_via_diffusion(encoded_obs)
             latents_mean = belief_info['latent_mean']
@@ -317,7 +319,7 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
             next_belief_info = self.active_inference.update_belief_via_diffusion(encoded_next_obs)
             next_latents = next_belief_info['latent']
         torch.nn.utils.clip_grad_norm_(self.active_inference.latent_score_network.parameters(),
-                                       0.1)    
+                                       max_norm=1.0 )    
         # 3. Train diffusion components
         self.score_optimizer.zero_grad()
         elbo_loss, elbo_info = self.active_inference.compute_diffusion_elbo(

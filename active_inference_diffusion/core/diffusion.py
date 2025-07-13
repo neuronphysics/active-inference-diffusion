@@ -218,7 +218,7 @@ class LatentDiffusionProcess(nn.Module):
         # Reverse diffusion process
         for t in reversed(range(self.config.num_diffusion_steps)):
             t_batch = torch.full((batch_size,), t, device=device, dtype=torch.long)
-            
+            t_batch = torch.clamp(t_batch, 0, self.config.num_diffusion_steps - 1)
             # Predict score conditioned on observation
             score = score_network(z, t_batch.float(), observation)
             
@@ -254,6 +254,8 @@ class LatentDiffusionProcess(nn.Module):
             
             t_batch = torch.full((batch_size,), t, device=device, dtype=torch.long)
             score = score_network(z, t_batch.float(), observation)
+            if torch.isnan(score).any() or torch.isinf(score).any():
+                raise ValueError(f"Score network output contains NaN or Inf values at timestep {t}")
             
             # Use modified p_sample that handles DDIM logic
             z = self.p_sample(z, t_batch, score, 
@@ -310,7 +312,7 @@ class LatentDiffusionProcess(nn.Module):
         sqrt_recip_alphas_t = extract(1.0 / torch.sqrt(self.alphas), t, z_t.shape)
         
         # Predict z_0
-        predicted_z_start = (z_t + sqrt_one_minus_alphas_cumprod_t * score) * sqrt_recip_alphas_t
+        predicted_z_start = (z_t - sqrt_one_minus_alphas_cumprod_t * score) * sqrt_recip_alphas_t
         
         # Compute posterior mean
         posterior_mean = self._posterior_mean(predicted_z_start, z_t, t)
@@ -361,25 +363,24 @@ class LatentDiffusionProcess(nn.Module):
         alpha_next = self.alphas_cumprod[t_next] if t_next > 0 else torch.ones_like(alpha_t)
         
         # Compute the predicted start point
-        sqrt_one_minus_alpha_t = extract(self.sqrt_one_minus_alphas_cumprod, t, z_t.shape)
-        pred_z0 = (z_t + sqrt_one_minus_alpha_t * score) / torch.sqrt(alpha_t)
-        
+        sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t)
+        noise = - score * sqrt_one_minus_alpha_t
+        pred_z0 = (z_t - sqrt_one_minus_alpha_t * noise) / torch.sqrt(alpha_t)
+        pred_z0 = torch.clamp(pred_z0, min=-3, max=3)
+
         # Compute variance for this step (this is where eta comes in!)
-        sigma_t = eta * torch.sqrt((1 - alpha_next) / (1 - alpha_t) * (1 - alpha_t / alpha_next))
-        
+        sigma_t = eta * torch.sqrt(torch.clamp((1 - alpha_next) / (1 - alpha_t) * (1 - alpha_t / alpha_next), min=0))
+
         # Compute the "direction" pointing from z_t to z_0
-        pred_dir_zt = torch.sqrt(1 - alpha_next - sigma_t ** 2) * \
-                  (z_t - torch.sqrt(alpha_t) * pred_z0) / sqrt_one_minus_alpha_t
-    
+        pred_dir_zt = torch.sqrt(1 - alpha_next - sigma_t ** 2) * noise
         # Compute the next sample
         z_next = torch.sqrt(alpha_next) * pred_z0 + pred_dir_zt
-
+        if torch.isnan(z_next).any() or torch.isinf(z_next).any() or torch.isnan(sigma_t).any() or torch.isinf(sigma_t).any():
+            raise ValueError(f"Generated latent contains NaN or Inf values at timestep {t} in DDIM sampling")
         # Add noise scaled by sigma_t (this is the stochastic part!)
         if eta > 0 and t[0] > 0:  # No noise at the final step
             noise = torch.randn_like(z_t)
             z_next = z_next + sigma_t * noise
-        else:
-            z_next = z_next
             
         return z_next
 

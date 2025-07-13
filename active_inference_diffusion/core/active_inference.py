@@ -286,48 +286,68 @@ class DiffusionActiveInference(nn.Module):
             batch_size = 1
         else:
             batch_size = observation.shape[0]
-        if batch_size == 1:
-            # Expand observation to run multiple trajectories in parallel
-            expanded_obs = observation.expand(num_trajectories, -1)
- 
-            # Generate multiple trajectories in ONE CALL (vectorized!)
-            trajectories = self.latent_diffusion.generate_latent_trajectory(
-                score_network=self.latent_score_network,
-                batch_size=num_trajectories,  # Run num_trajectories in parallel
-                observation=expanded_obs,
-                deterministic=False  
-            )
-            # TODO how to fix this for batch_size == 1 to include uncertainty?
-            final_latents = trajectories[-1]  # Shape: (num_trajectories, latent_dim)
-
-            # Compute statistics across trajectories
-            latent_mean = final_latents.mean(dim=0, keepdim=True)  # Shape: (1, latent_dim)
-            latent_std = final_latents.std(dim=0, keepdim=True)    # Shape: (1, latent_dim)
+        with torch.no_grad():
+            # Save training states of all components involved in belief generation
+            training_states = {
+                'score_network': self.latent_score_network.training,
+                'diffusion': self.latent_diffusion.training,
+            }
         
-            # For current latent, we have options:
+            # Set to eval mode for deterministic belief generation
+            self.latent_score_network.eval()
+            self.latent_diffusion.eval()
+
+            if batch_size == 1:
+                # Expand observation to run multiple trajectories in parallel
+                expanded_obs = observation.expand(num_trajectories, -1)
+
+                with torch.autograd.set_detect_anomaly(True):
+                    # Generate multiple trajectories in parallel
+                    trajectories = self.latent_diffusion.generate_latent_trajectory(
+                        score_network=self.latent_score_network,
+                        batch_size=num_trajectories,  # Run num_trajectories in parallel
+                        observation=expanded_obs,
+                        deterministic=False  
+                    )
+                
+                final_latents = trajectories[-1]  # Shape: (num_trajectories, latent_dim)
+
+                # Compute statistics across trajectories
+                latent_mean = final_latents.mean(dim=0, keepdim=True)  # Shape: (1, latent_dim)
+                latent_std = final_latents.std(dim=0, keepdim=True)    # Shape: (1, latent_dim)
+        
+                # For current latent, we have options:
             
-            eps = torch.randn_like(latent_std)
-            self.current_latent = latent_mean + eps * latent_std
+                eps = torch.randn_like(latent_std)
+                self.current_latent = latent_mean + eps * latent_std
         
     
-            # Store the full trajectory for analysis
-            self.latent_trajectory = trajectories
-            trajectory_length = len(trajectories)
-        else:
-            # Generate latent via reverse diffusion conditioned on observation
-            trajectories = self.latent_diffusion.generate_latent_trajectory(
-                score_network=self.latent_score_network,
-                batch_size=batch_size,
-                observation=observation,
-                deterministic=False
-            )
+                # Store the full trajectory for analysis
+                self.latent_trajectory = trajectories
+                trajectory_length = len(trajectories)
+            else:
+                # Generate latent via reverse diffusion conditioned on observation
+                with torch.autograd.set_detect_anomaly(True):
+                    trajectories = self.latent_diffusion.generate_latent_trajectory(
+                        score_network=self.latent_score_network,
+                        batch_size=batch_size,
+                        observation=observation,
+                        deterministic=False
+                        )
         
-            # Final latent is the belief
-            self.current_latent = trajectories[-1]
-            self.latent_trajectory = trajectories
-            latent_mean = self.current_latent.mean(dim=0, keepdim=True)
-            latent_std = self.current_latent.std(dim=0, keepdim=True)
-            trajectory_length = len(trajectories)
+                # Final latent is the belief
+                self.current_latent = trajectories[-1]
+                self.latent_trajectory = trajectories
+                latent_mean = self.current_latent.mean(dim=0, keepdim=True)
+                latent_std = self.current_latent.std(dim=0, keepdim=True)
+                trajectory_length = len(trajectories)
+        self.latent_score_network.train(training_states['score_network'])
+        self.latent_diffusion.train(training_states['diffusion'])
+    
+        # Validate outputs before returning
+        if torch.isnan(self.current_latent).any() or torch.isinf(self.current_latent).any():
+            raise ValueError("Generated latents contain NaN or Inf values inside belief update!")
+
         return {
             'latent': self.current_latent,
             'latent_mean': latent_mean.squeeze(0),
