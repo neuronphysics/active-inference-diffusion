@@ -7,6 +7,42 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import Optional
+class FrameTimeEmbedder(nn.Module):
+    def __init__(self, hidden_size, freq_dim=64):
+        super().__init__()
+        self.pos = SinusoidalPositionEmbeddings(freq_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(freq_dim, hidden_size), 
+            nn.LayerNorm(hidden_size),
+            nn.SiLU(), 
+            nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+        )
+        self.freq_dim = freq_dim
+    def forward(self, tau):  # tau: (B,) int frame idx or float in [0,1]
+        emb = self.pos(tau)  # reuse your sinusoidal piece
+        return self.mlp(emb)
+
+class ActionEmbedder(nn.Module):
+    def __init__(self, action_dim, hidden_size, dropout_prob=0.1):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(action_dim, hidden_size), 
+            nn.LayerNorm(hidden_size),
+            nn.SiLU(), 
+            nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+        )
+        self.dropout_prob = float(dropout_prob)
+    def forward(self, a, training: bool, force_drop: Optional[torch.Tensor] = None):
+        # classifier-free style dropout for actions (unconditional branch)
+        if self.dropout_prob > 0 and (training or force_drop is not None):
+            if force_drop is None:
+                drop = (torch.rand(a.size(0), device=a.device) < self.dropout_prob).float().unsqueeze(1)
+            else:
+                drop = force_drop.to(a.device).float().unsqueeze(1)
+            a = a * (1.0 - drop)
+        return self.proj(a)
 
 
 class LatentScoreNetwork(nn.Module):
@@ -21,6 +57,7 @@ class LatentScoreNetwork(nn.Module):
         self,
         latent_dim: int,
         observation_dim: int,
+        action_dim: int,
         hidden_dim: int = 256,
         time_embed_dim: int = 128,
         num_layers: int = 6,
@@ -31,7 +68,7 @@ class LatentScoreNetwork(nn.Module):
         
         self.latent_dim = latent_dim
         self.observation_dim = observation_dim
-        
+        self.action_dim = action_dim
         # DiT configuration
         self.num_heads = 8
         self.mlp_ratio = 4.0
@@ -99,6 +136,11 @@ class LatentScoreNetwork(nn.Module):
             nn.Linear(hidden_dim // 2, latent_dim, bias=False)
         )
         self.output_multiplier = nn.Parameter(torch.ones(1) * output_scale)
+        self.ft_embedder = FrameTimeEmbedder(hidden_dim)          # new
+        self.a_embedder  = ActionEmbedder(action_dim= self.action_dim,  # set actual action_dim in config
+                                  hidden_size=hidden_dim,
+                                  dropout_prob=0.1)        # new
+
         # Initialize output to zero for stability
         self.apply(self.init_weights)
 
@@ -109,13 +151,15 @@ class LatentScoreNetwork(nn.Module):
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
     
-    
 
     def forward(
         self,
         z_t: torch.Tensor,
         time: torch.Tensor,
-        observation: Optional[torch.Tensor] = None
+        observation: Optional[torch.Tensor] = None,
+        frame_time: Optional[torch.Tensor] = None,
+        action: Optional[torch.Tensor] = None,
+        force_drop_action: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute score ∇_z log p_t(z|o)
@@ -129,7 +173,6 @@ class LatentScoreNetwork(nn.Module):
             Score [batch_size, latent_dim]
         """
         # Embed time
-        t_emb = self.time_embed(time)
         batch_size = z_t.shape[0]
         is_continuous = time.max() <= 1.0 and time.min() >= 0.0
     
@@ -160,12 +203,14 @@ class LatentScoreNetwork(nn.Module):
             obs_emb = F.normalize(obs_emb, dim=-1)
         else:
             # Use learned null embedding
-            obs_emb = torch.zeros(batch_size, self.obs_encoder[-1].out_features, 
-                                device=z_t.device)
-        
+            obs_emb = torch.zeros(batch_size, self.latent_proj.out_features, device=z_t.device) 
+                                
+        B, H = z_t.shape[0], self.latent_proj.out_features  # H == hidden_dim
+        ft_emb = self.ft_embedder(frame_time) if frame_time is not None else torch.zeros(B, H, device=z_t.device)
+        a_emb = self.a_embedder(action, self.training, force_drop_action) if action is not None else torch.zeros(B, H, device=z_t.device)
         # Combine conditioning (time + observation)
         # This will be used for adaptive normalization in DiT blocks
-        conditioning = t_emb + obs_emb  # [B, hidden_dim]
+        conditioning = t_emb + obs_emb + ft_emb + a_emb
         
         # Project latent to hidden dimension
         h = self.latent_proj(z_t)  # [B, hidden_dim]

@@ -384,10 +384,12 @@ def train_diffusion_active_inference(
                steps_collected % 5000 < collection_steps and len(agent.replay_buffer) > 0:
                 sample_batch = agent.replay_buffer.sample(min(4, len(agent.replay_buffer)))
                 sample_obs = sample_batch['observations']
+                sample_actions = sample_batch['actions']
+                
                 recon_error = visualize_reconstruction(
                     agent,
                     sample_obs,
-                    f"plots/reconstruction_step_{steps_collected}.png"
+                    save_path=f"plots/reconstruction_step_{steps_collected}.png"
                 )
                 logger.log({'reconstruction_error': recon_error}, steps_collected)
             

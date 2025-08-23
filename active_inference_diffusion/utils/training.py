@@ -11,7 +11,7 @@ import gymnasium as gym
 import matplotlib.pyplot as plt
 from typing import List, Optional, Any
 import json
-
+from gymnasium.wrappers import RecordVideo
 def evaluate_agent(
     agent: Any, 
     env: gym.Env, 
@@ -198,7 +198,7 @@ def create_video(
         >>> from active_inference_diffusion.utils.training import create_video
         >>> create_video(agent, env, "halfcheetah_trained.mp4", num_episodes=3)
     """
-    from gymnasium.wrappers import RecordVideo
+    
     
     # Create video directory
     Path(video_folder).mkdir(exist_ok=True)

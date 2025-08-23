@@ -76,14 +76,23 @@ class ActiveInferenceConfig:
     max_preference_temperature: float = 10.0  # Upper bound for exploration
     temperature_decay: float = 0.995  # Exponential decay per episode
     use_reward_preferences: bool = True  # Enable reward-oriented EFE
-    
+    #Dynamics model parameters
+    dynamics_type = "transformer"
+    dynamics_context_len = 16
+    dynamics_num_layers = 2
+    dynamics_n_heads = 4
+    dynamics_dropout = 0.1
+    dynamics_residual = True
+    dynamics_use_checkpointing = True
+    dynamics_attn_impl = "mem"       # good on 11GB cards
+
     # Preference shaping parameters
     baseline_reward: float = 0.0  # Baseline for reward centering
     preference_momentum: float = 0.9  # EMA for reward statistics    
     # Nested configs
     diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
     belief_dynamics: BeliefDynamicsConfig = field(default_factory=BeliefDynamicsConfig)
-    
+    frame_stack: int = 3
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 

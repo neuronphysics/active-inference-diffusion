@@ -12,7 +12,7 @@ import numpy as np
 
 class DrQV2Encoder(nn.Module):
     """
-    Enhanced DrQ-v2 encoder with modern architectural improvements
+    DrQ-v2 encoder with modern architectural improvements
     
     Key improvements:
     - Spectral normalization for training stability
@@ -245,6 +245,7 @@ class ConvDecoder(nn.Module):
         hidden_dim: int = 256,
         spatial_size: int = 21,  # For 84x84 output
         use_spectral_norm: bool = True,
+        frame_stack: int = 1,
         device: Optional[torch.device] = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ):
         super().__init__()
@@ -255,7 +256,8 @@ class ConvDecoder(nn.Module):
         self.img_channels = img_channels
         self.device = device
         self.hidden_dim = hidden_dim
-        
+        self.frame_stack = frame_stack
+
         # Initial projection with careful initialization
         self.latent_proj = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim * 4),
@@ -309,7 +311,7 @@ class ConvDecoder(nn.Module):
             nn.Conv2d(32, 32, kernel_size=3, padding=1),
             nn.InstanceNorm2d(32),
             nn.Mish(),
-            nn.Conv2d(32, img_channels, kernel_size=3, padding=1),
+            nn.Conv2d(32, img_channels * self.frame_stack, kernel_size=3, padding=1),
             nn.Sigmoid()  # Output in [0, 1]
         )
         self.to(self.device)
@@ -377,16 +379,13 @@ class DecoderBlock(nn.Module):
         layers = []
         
         if upsample:
-            # Sub-pixel convolution for better upsampling
-            # First increase channels, then pixel shuffle
-            layers.append(
-                nn.Conv2d(in_channels, out_channels * 4, kernel_size=3, padding=1)
-            )
+            # Replace PixelShuffle with: bilinear upsample → 3x3 conv
+            layers.append(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False))
+            conv_up = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
             if use_spectral_norm:
-                layers[-1] = nn.utils.spectral_norm(layers[-1])
-            
+                conv_up = nn.utils.spectral_norm(conv_up)
             layers.extend([
-                nn.PixelShuffle(2),  # Upsample by 2x
+                conv_up,
                 nn.InstanceNorm2d(out_channels),
                 nn.Mish()
             ])
@@ -420,15 +419,13 @@ class DecoderBlock(nn.Module):
             residual_layers = []
             
             if upsample:
-                # Use sub-pixel conv for residual too
-                residual_conv = nn.Conv2d(in_channels, out_channels * 4, kernel_size=1)
+                # Match main path: bilinear upsample → 1x1 conv
+                residual_layers.append(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False))
+                residual_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
                 if use_spectral_norm:
                     residual_conv = nn.utils.spectral_norm(residual_conv)
-                    
-                residual_layers.extend([
-                    residual_conv,
-                    nn.PixelShuffle(2)
-                ])
+                residual_layers.append(residual_conv)
+
             else:
                 residual_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
                 if use_spectral_norm:

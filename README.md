@@ -68,16 +68,15 @@ agent = PixelBasedAgent(env, config, training_config, pixel_config)
 
 ```bash
 # Train with state observations
-python examples/train_state_mujoco.py --env HalfCheetah-v4
+python examples/train_mujoco.py --env HalfCheetah-v4
 
 # Train with pixel observations  
-python examples/train_pixel_mujoco.py --env HalfCheetah-v4
-
-# Resume from checkpoint
-python examples/train_state_mujoco.py --env HalfCheetah-v4 --resume
+python examples/train_mujoco.py --env HalfCheetah-v4 --pixels
 
 # Use custom config
-python examples/train_pixel_mujoco.py --env Hopper-v4 --config examples/configs/hopper_pixel.yaml
+python examples/train_mujoco.py --env Hopper-v4  --pixels --config examples/configs/hopper_pixel.yaml
+
+
 ```
 
 ### Configuration Files

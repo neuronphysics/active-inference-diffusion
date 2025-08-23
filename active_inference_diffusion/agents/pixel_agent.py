@@ -14,7 +14,7 @@ from .base_agent import BaseActiveInferenceAgent
 from ..core.active_inference import DiffusionActiveInference
 from ..encoder.visual_encoders import RandomShiftAugmentation, DrQV2Encoder
 from ..encoder.state_encoders import EncoderFactory
-from ..utils.buffers import ReplayBuffer
+from ..utils.buffers import ReplayBuffer, SequenceReplayBuffer
 from ..configs.config import (
     ActiveInferenceConfig,
     PixelObservationConfig,
@@ -91,9 +91,7 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
         )
         
         # Augmentation module
-        self.augmentation = RandomShiftAugmentation(
-            pad=self.pixel_config.random_shift_pad
-        ) if self.pixel_config.augmentation else None
+        self.augmentation = RandomShiftAugmentation(pad=self.pixel_config.random_shift_pad) if self.pixel_config.augmentation else None
         
         # Core diffusion active inference
         # Uses encoder output dimension as observation dimension
@@ -113,7 +111,9 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
     def act(
         self,
         observation: np.ndarray,
-        deterministic: bool = False
+        deterministic: bool = False,
+        frame_idx: Optional[torch.Tensor] = None,
+        actions: Optional[torch.Tensor] = None,
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
         """
         Select action using visual encoding and diffusion active inference
@@ -136,7 +136,9 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
             action_tensor, info = self.active_inference.act(
                 encoded_obs.squeeze(0),  # Remove batch dimension
                 deterministic=deterministic,
-                raw_observation=obs_tensor
+                raw_observation=obs_tensor,
+                from_idx= frame_idx,
+                actions=actions
             )
             
         # Convert to numpy
@@ -213,12 +215,13 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
             buffer_obs_shape = (self.frame_stack, *self.obs_shape)
         else:
             buffer_obs_shape = self.obs_shape
-        return ReplayBuffer(
+        return SequenceReplayBuffer(
             capacity=self.training_config.buffer_size,
             obs_shape=buffer_obs_shape,
             action_dim=self.action_dim,
             device=self.device,
-            optimize_memory=True  # Enable compression for pixels
+            sequence_length=self.config.sequence_length if hasattr(self.config, 'sequence_length') else 10,
+            overlap=5
         )
         
     def _process_observation(self, observation: np.ndarray) -> torch.Tensor:
@@ -292,31 +295,26 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
         actions = batch['actions'].to(self.device)
         rewards = batch['rewards'].to(self.device)
         dones = batch['dones'].to(self.device)
-        
+        frame_idx = batch['frame_idx'].to(self.device)
+        prev_actions = batch['prev_actions'].to(self.device) 
         metrics = {}
         
         # 1. Encode observations to feature space
         encoded_obs = self.encode_observation(obs)
         encoded_next_obs = self.encode_observation(next_obs)
+        batch_size = self.config.batch_size
         # First, update reward normalizer statistics
-        self.reward_normalizer.update(rewards.cpu().numpy())
-
-        # Normalize rewards
-        normalized_rewards = torch.tensor(
-                self.reward_normalizer.normalize(rewards.cpu().numpy()),
-                device=self.device,
-                dtype=torch.float32
-                )
+        
         # 2. Generate latents via diffusion
         if torch.isnan(encoded_obs).any() or torch.isinf(encoded_obs).any():
             raise ValueError("Encoded observation contains NaN or Inf values")
         with torch.no_grad():
-            belief_info = self.active_inference.update_belief_via_diffusion(encoded_obs)
+            belief_info = self.active_inference.update_belief_via_diffusion(encoded_obs, frame_idx=frame_idx, actions=prev_actions)
             latents_mean = belief_info['latent_mean']
             latents_std = belief_info['latent_std']
             latents = belief_info['latent']
 
-            next_belief_info = self.active_inference.update_belief_via_diffusion(encoded_next_obs)
+            next_belief_info = self.active_inference.update_belief_via_diffusion(encoded_next_obs, frame_idx=frame_idx+1, actions=actions)
             next_latents = next_belief_info['latent']
         torch.nn.utils.clip_grad_norm_(self.active_inference.latent_score_network.parameters(),
                                        max_norm=1.0 )    
@@ -324,13 +322,19 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
         self.score_optimizer.zero_grad()
         elbo_loss, elbo_info = self.active_inference.compute_diffusion_elbo(
             encoded_obs, 
-            normalized_rewards, 
-            raw_observations=obs
+            rewards, 
+            raw_observations=obs, 
+            frame_index=frame_idx,
+            actions=prev_actions,
         )
 
         # 4. Add contrastive representation loss
+        hidden_states = self.active_inference.reset_dynamics_hidden(batch_size)
+        
+        hidden_states = self.active_inference._reset_done_hidden(hidden_states, dones)
+
         contrastive_loss = self.compute_representation_loss(
-            encoded_obs, encoded_next_obs, actions, latents, next_latents
+            encoded_obs, encoded_next_obs, actions, latents, hidden_states
         )
 
         # Combined loss
@@ -352,6 +356,7 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
 
         # 5. Train policy network
         self.policy_optimizer.zero_grad()
+        self.active_inference.latent_dynamics.train()
         
         efe, efe_info = self.active_inference.compute_expected_free_energy_diffusion(
             latents,
@@ -381,7 +386,7 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
         with torch.no_grad():
             next_values = self.active_inference.value_network(next_latents, time_next).squeeze(-1)
             targets = self.active_inference.compute_lambda_returns(
-                    rewards=normalized_rewards,
+                    rewards=rewards,
                     values=values,
                     next_values=next_values,
                     dones=dones,
@@ -408,19 +413,65 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
             metrics.update(epistemic_metrics)
 
         # 7. Train dynamics model
-        self.dynamics_optimizer.zero_grad()
+        # Add sequence-based dynamics training every N steps
+        if self.total_steps % 5 == 0 and hasattr(self.replay_buffer, 'sample_sequences'):
+            seq_batch = self.replay_buffer.sample_sequences(self.config.batch_size // 2)
         
-        predicted_next_latents, predicted_next_logvar = self.active_inference.predict_next_latent(latents, actions)
-        dynamics_loss = F.mse_loss(predicted_next_latents, next_latents)
-        dynamics_loss.backward()
-        
-        torch.nn.utils.clip_grad_norm_(
-            self.active_inference.latent_dynamics.parameters(),
-            self.config.gradient_clip
-        )
-        self.dynamics_optimizer.step()
-        
-        metrics['dynamics_loss'] = dynamics_loss.item()
+            if seq_batch is not None:
+                # Process sequences through encoder
+                seq_obs = seq_batch['observations']  # [batch, seq_len, ...]
+                batch_size, seq_len = seq_obs.shape[:2]
+            
+                # Encode all observations in sequences
+                latent_sequences = []
+                for t in range(seq_len):
+                    obs_t = self._process_batch_observations(seq_obs[:, t])
+                    encoded_t = self.encode_observation(obs_t)
+                
+                    # Generate latents via diffusion
+                    with torch.no_grad():
+                        if t== 0:
+                            prev_acts = seq_batch['prev_actions'][:, 0].to(self.device) if 'prev_actions' in seq_batch else torch.zeros(batch_size, self.action_dim, device=self.device)
+                        else:
+                            prev_acts = seq_batch['prev_actions'][:, t-1].to(self.device)
+                        belief_info = self.active_inference.update_belief_via_diffusion(encoded_t, frame_idx=seq_batch['frame_idx'][:, t].to(self.device), actions=prev_acts)
+                        latent_sequences.append(belief_info['latent'])
+            
+                latent_sequences = torch.stack(latent_sequences, dim=1)
+            
+                # Train dynamics on sequences
+                self.dynamics_optimizer.zero_grad()
+            
+                dynamics_metrics = self.active_inference.train_dynamics_on_sequence(
+                    latent_sequences,
+                    seq_batch['actions'],
+                    seq_batch['dones'],
+                    seq_batch['lengths'],
+                )
+            
+                # Get the loss tensor for backward
+                dynamics_loss = dynamics_metrics['dynamics_loss']
+                if isinstance(dynamics_loss, float):
+                    # Recompute to get tensor
+                    dynamics_loss_tensor = self.active_inference.train_dynamics_on_sequence(
+                        latent_sequences,
+                        seq_batch['actions'],
+                        seq_batch['dones'],
+                        seq_batch['lengths']
+                    )['dynamics_loss']
+                else:
+                    dynamics_loss_tensor = dynamics_loss
+                
+                dynamics_loss_tensor.backward()
+            
+                torch.nn.utils.clip_grad_norm_(
+                    self.active_inference.latent_dynamics.parameters(),
+                    self.config.gradient_clip
+                )
+                self.dynamics_optimizer.step()
+            
+                metrics.update({f'seq_{k}': v for k, v in dynamics_metrics.items()})
+
         self.total_steps += 1
         
         return metrics
@@ -431,14 +482,18 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
         next_obs: torch.Tensor,
         actions: torch.Tensor,
         latents: torch.Tensor,
-        next_latents: torch.Tensor
+        hidden_states: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
     ) -> torch.Tensor:
         """
         Contrastive loss for visual representation learning
         Ensures latent dynamics align with visual features
         """
+        status_training= self.active_inference.latent_dynamics.training
+        self.active_inference.latent_dynamics.train()
         # Predict next visual features from current latent and action
-        predicted_next_latent, predicted_logvar = self.active_inference.predict_next_latent(latents, actions)
+        predicted_next_latent, predicted_logvar, hidden_states = self.active_inference.predict_next_latent(latents, actions, hidden_states)
+        
+        self.active_inference.latent_dynamics.train(status_training)
         predicted_std = torch.exp(0.5 * predicted_logvar)
         # Normalize for contrastive loss
         pred_norm = F.normalize(predicted_next_latent, dim=-1)
@@ -483,6 +538,7 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
             self.active_inference.value_network.parameters(),
             lr=self.config.learning_rate
         )
+    
         
         # Dynamics optimizer
         self.dynamics_optimizer = torch.optim.AdamW(
@@ -499,9 +555,5 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
             betas=(0.9, 0.999)
         )
         self.active_inference.epistemic_optimizer = self.epistemic_optimizer
-        # Score network optimizer
-        self.score_optimizer = torch.optim.Adam(
-            self.active_inference.latent_score_network.parameters(),
-            lr=self.config.learning_rate
-        )
+
 

@@ -77,6 +77,8 @@ class SpatialAttentionAggregator(nn.Module):
 def visualize_reconstruction(
     agent,
     observations: torch.Tensor,
+    frame_idx: Optional[torch.Tensor] = None,
+    actions: Optional[torch.Tensor] = None,
     save_path: Optional[str] = None,
     max_samples: int = 4,
     visualization_mode: str = "recent"
@@ -102,7 +104,11 @@ def visualize_reconstruction(
         # Move observations to device
         if observations.device != device:
             observations = observations.to(device)
-            
+        if frame_idx is not None and not torch.is_tensor(frame_idx):
+            frame_idx = torch.as_tensor(frame_idx, device=device)
+        if actions is not None and actions.device != device:
+            actions = actions.to(device)
+
         # For pixel observations, we need to encode them first
         if hasattr(agent, 'encoder') and agent.config.pixel_observation:
             # Encode pixel observations to features
@@ -112,7 +118,9 @@ def visualize_reconstruction(
             encoded_obs = observations[:max_samples]
         
         # Generate latents via diffusion
-        belief_info = agent.active_inference.update_belief_via_diffusion(encoded_obs)
+        belief_info = agent.active_inference.update_belief_via_diffusion(encoded_obs, 
+                                                                         frame_idx=frame_idx[:max_samples] if frame_idx is not None else None,
+                                                                         actions=actions[:max_samples] if actions is not None else None)
         latents = belief_info['latent']
         
         # Decode latents back to observation space
@@ -370,3 +378,36 @@ def process_frame_stack(frames: np.ndarray, mode: str = "recent") -> np.ndarray:
         frame = frames[-1]  # Default to most recent
     
     return process_single_frame(frame)
+
+# --- Dreamer-style symlog / symexp and two-hot utils ---
+def symlog(x):
+    return x.sign() * (x.abs() + 1.0).log()
+
+def symexp(x):
+    return x.sign() * (x.abs().exp() - 1.0)
+
+def make_symlog_bins(num_bins=255, lo=-20.0, hi=20.0, device=None, dtype=None):
+    bins_symlog = torch.linspace(lo, hi, num_bins, device=device, dtype=dtype)
+    bins_real = symexp(bins_symlog)
+    return bins_symlog, bins_real
+
+def twohot_encode(x_symlog, bins_symlog):
+    B = bins_symlog.shape[0]
+    lo, hi = bins_symlog[0], bins_symlog[-1]
+    pos = (x_symlog - lo) / (hi - lo) * (B - 1)
+    pos = pos.clamp(0, B - 1 - torch.finfo(x_symlog.dtype).eps)
+    idx0 = pos.floor().long()
+    idx1 = (idx0 + 1).clamp_max(B - 1)
+    w1 = (pos - idx0.float())
+    w0 = 1.0 - w1
+    # build soft labels
+    shape = x_symlog.shape + (B,)
+    target = torch.zeros(shape, device=bins_symlog.device, dtype=torch.float32)
+    # scatter weights into target
+    target.scatter_(-1, idx0.unsqueeze(-1), w0.unsqueeze(-1))
+    target.scatter_add_(-1, idx1.unsqueeze(-1), w1.unsqueeze(-1))
+    return target
+
+def categorical_ce_with_soft_targets(logits, soft_targets):
+    logp = torch.log_softmax(logits, dim=-1)
+    return -(soft_targets * logp).sum(dim=-1)

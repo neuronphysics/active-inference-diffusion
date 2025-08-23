@@ -87,7 +87,7 @@ class BaseActiveInferenceAgent(ABC):
         self.total_steps = 0
         self.episode_count = 0
         self.exploration_noise = training_config.exploration_noise
-        self.reward_normalizer = RunningMeanStd(shape=())
+        
         
     @abstractmethod
     def _setup_dimensions(self):
