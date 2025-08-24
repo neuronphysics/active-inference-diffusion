@@ -168,15 +168,15 @@ def train_diffusion_active_inference(
     # Create configurations
     config = ActiveInferenceConfig(
         env_name=env_name,
-        latent_dim=64,
+        latent_dim=36,
         hidden_dim=32,
-        learning_rate=8e-5,
-        batch_size=128,
+        learning_rate=4e-5,
+        batch_size=100,
         efe_horizon=5,
-        epistemic_weight=0.1,
+        epistemic_weight=0.5,
         pragmatic_weight=1.0,
         consistency_weight=0.1,
-        kl_weight=0.5,
+        kl_weight=0.75,
         diffusion_weight=1.0,
         pixel_observation=use_pixels,
         device=device
@@ -476,7 +476,7 @@ if __name__ == "__main__":
     parser.add_argument('--pixels', action='store_true', 
                         help='Use pixel observations')
     parser.add_argument('--timesteps', type=int, default=1_000_000)
-    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--num_parallel_envs', type=int, default=3,
                         help='Number of parallel environments for data collection')

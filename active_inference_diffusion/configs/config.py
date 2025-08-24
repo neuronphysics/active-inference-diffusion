@@ -10,7 +10,7 @@ import torch
 @dataclass
 class DiffusionConfig:
     """Configuration for diffusion process"""
-    num_diffusion_steps: int = 200
+    num_diffusion_steps: int = 400
     beta_start: float = 1e-4
     beta_end: float = 0.02
     beta_schedule: str = "cosine"  # Options: "cosine", "linear"
@@ -59,9 +59,9 @@ class ActiveInferenceConfig:
     diffusion_weight: float = 1.0  # score matching weight
     reward_weight:float = 0.5  # reward scaling
     # Model architecture
-    hidden_dim: int = 512
-    latent_dim: int = 128
-    spatial_aggregator_output_dim:int = 256
+    hidden_dim: int = 128
+    latent_dim: int = 96
+    spatial_aggregator_output_dim:int = 32
     num_layers: int = 3
     pixel_observation: bool = False  # Use pixel observations
     # Training

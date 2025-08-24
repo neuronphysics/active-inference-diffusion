@@ -88,7 +88,7 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
             frame_stack=self.pixel_config.frame_stack,
             num_layers=4,
             num_filters=32,
-        )
+        ).to(self.device)
         
         # Augmentation module
         self.augmentation = RandomShiftAugmentation(pad=self.pixel_config.random_shift_pad) if self.pixel_config.augmentation else None
@@ -100,7 +100,8 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
             action_dim=self.action_dim,
             latent_dim=self.config.latent_dim,
             config=self.config,
-            pixel_shape=self.obs_shape if self.pixel_config.pixel_observation else None
+            pixel_shape=self.obs_shape if self.pixel_config.pixel_observation else None,
+            shared_visual_encoder=self.encoder 
         )
         
 

@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.func import vmap, linearize
+from torch.autograd import forward_ad as fwAD
 import numpy as np
 from typing import Dict, Tuple, Optional, Union, Any
 from ..configs import ActiveInferenceConfig
@@ -37,6 +38,7 @@ class DiffusionActiveInference(nn.Module):
         latent_dim: int,
         config: "ActiveInferenceConfig",
         pixel_shape: Optional[Tuple[int, int, int]] = None,
+        shared_visual_encoder: Optional[nn.Module] = None
     ):
         super().__init__()
 
@@ -48,7 +50,7 @@ class DiffusionActiveInference(nn.Module):
         self.is_pixel_observation = config.pixel_observation
         self.epistemic_dropout_rate = 0.2
         self.device = torch.device(config.device)
-
+        self.shared_visual_encoder = shared_visual_encoder
         if self.is_pixel_observation and pixel_shape is not None:
             self.raw_observation_shape = pixel_shape
         else:
@@ -190,12 +192,19 @@ class DiffusionActiveInference(nn.Module):
         # Epistemic estimator for latent uncertainty
         self.epistemic_estimator = FunctionSpaceEpistemicEstimator(
             decoder=self.observation_decoder,
+            feature_extractor=self.shared_visual_encoder,
             latent_dim=self.latent_dim,
             observation_shape=observation_shape,
-            hidden_dim=self.config.hidden_dim,
-            spatial_aggregator_output_dim=self.config.spatial_aggregator_output_dim,
-            is_pixel_observation=self.is_pixel_observation,
+            is_pixel=self.is_pixel_observation,
             device=self.device,
+            hidden_dim=self.config.hidden_dim,
+            jac_dim=self.config.spatial_aggregator_output_dim,
+            latent_proj_dim=self.latent_dim,   
+            use_checkpointing=True,     # Enable checkpointing
+            checkpoint_critic=True,
+            checkpoint_jacproj=True,
+            checkpoint_latproj=True,
+            robust_marginals=False,     
         )
         self.num_reward_bins = getattr(self.config, "num_reward_bins", 255)
         bins_symlog, bins_real = make_symlog_bins(self.num_reward_bins, device=self.device, dtype=torch.float32)
@@ -489,7 +498,7 @@ class DiffusionActiveInference(nn.Module):
         latent: torch.Tensor,
         horizon: int = 5,
         num_trajectories: int = 6,
-        num_ambiguity_samples: int = 5,
+        num_ambiguity_samples: int = 3,
         hidden_state: HiddenState= None,
         done_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -927,7 +936,7 @@ class DiffusionActiveInference(nn.Module):
             ).sum(dim=-1)
 
             # Apply sequence mask
-            masked_nll = (nll * mask).sum() / (mask.sum() + 1e-8)
+            masked_nll = (nll * mask).sum() / (mask.sum() + torch.finfo(torch.float32).eps)
 
             # Reset hidden states where episodes ended
             # This is crucial for proper sequence handling!
@@ -1013,7 +1022,7 @@ class DiffusionActiveInference(nn.Module):
                     weighted_return += last_weight * returns[-1]
                     lambda_sum += last_weight
 
-                lambda_returns[idx] = weighted_return / (lambda_sum + 1e-8)
+                lambda_returns[idx] = weighted_return / (lambda_sum + torch.finfo(torch.float32).eps)
             else:
                 if exclude_immediate_rewards:
                     lambda_returns[idx] = (
@@ -1161,261 +1170,254 @@ def ema_loss(x, running_mean, alpha=0.01):
     return t_log, running_mean
 
 
+
+
 class FunctionSpaceEpistemicEstimator(nn.Module):
     """
-    Computes epistemic value I(o; θ | z) via function-space features
-    using neural tangent kernel approximation and MINE estimation
+    Memory-efficient epistemic estimator using JVP features of decoder outputs,
+    passed through a *provided* feature_extractor (built outside, e.g., in your
+    state agent or pixel agent).
+
+    Clean API:
+      - decoder: nn.Module mapping latent z -> observation x
+      - feature_extractor: nn.Module mapping observation x -> feature vector
+      - is_pixel: whether x is [C,H,W] (True) or flat [D] (False)
+      - No internal construction of encoders. No AMP/mixed precision.
+
+    Forward returns a per-batch epistemic score based on a MINE-DV lower bound:
+       I(Z; Φ(J_z f)) ≈ E_joint[T] - log E_marg[exp T]
+    where Φ encodes JVPs of f (decoder) along random directions in z-space.
     """
 
     def __init__(
         self,
+        *,
         decoder: nn.Module,
+        feature_extractor: nn.Module,
         latent_dim: int,
         observation_shape: Union[int, Tuple[int, int, int]],
-        hidden_dim: int = 256,
-        spatial_aggregator_output_dim: int = 256,
-        is_pixel_observation: bool = True,
+        is_pixel: bool,
         device: Union[str, torch.device] = "cuda",
-        use_gradient_checkpointing: bool = True,
+        ntk_samples: int = 3,
+        jvp_chunk_size: int = 1,
+        hidden_dim: int = 256,
+        jac_dim: int = 128,
+        latent_proj_dim: int = 128,
+        use_checkpointing: bool = False,
+        checkpoint_critic: Union[bool, None] = None,
+        checkpoint_jacproj: Union[bool, None] = None,
+        checkpoint_latproj: Union[bool, None] = None,
+        robust_marginals: bool = False,
+        eps: float = torch.finfo(torch.float32).eps,
     ) -> None:
-
         super().__init__()
+
+        # External modules
         self.decoder = decoder
-        self.latent_dim = latent_dim
-        self.is_pixel = is_pixel_observation
-        self.device = torch.device(device) if isinstance(device, str) else device
-        self.use_gradient_checkpointing = use_gradient_checkpointing
-        # Jacobian approximation parameters
-        self.ntk_samples = 3
-        self.perturbation_scale = nn.Parameter(torch.tensor(0.1)).to(self.device)
+        self.feature_extractor = feature_extractor
 
-        if self.is_pixel:
-            self.pixel_shape = observation_shape
-            # Pixel-aware MINE architecture using ConvolutionalStatisticsNetwork pattern
-            self.pixel_processor = nn.Sequential(
-                nn.Conv2d(self.pixel_shape[0], 32, kernel_size=5, stride=2, padding=2),
-                nn.ReLU(),
-                nn.Conv2d(32, 64, kernel_size=5, stride=2, padding=2),
-                nn.ReLU(),
-                nn.Conv2d(64, 128, kernel_size=5, stride=2, padding=2),
-                nn.ReLU(),
-            )
-            # Spatial attention aggregator instead of average pooling
-            self.spatial_aggregator = SpatialAttentionAggregator(
-                feature_dim=128,
-                num_heads=8,
-                spatial_dim=21,  # After 3 stride-2 convolutions from 84x84
-            )
-            # Jacobian feature projection
-            jacobian_dim = (
-                spatial_aggregator_output_dim * self.ntk_samples
-            )  # 128 channels, 2 spatial dimensions (H, W)
-        else:
-            self.state_dim = observation_shape
-            self.feature_extractor = nn.Sequential(
-                nn.Linear(self.state_dim, hidden_dim // 2),
-                nn.ReLU(),
-                nn.Linear(hidden_dim // 2, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim // 2),
-            )
-            jacobian_dim = hidden_dim // 2 * self.ntk_samples
+        # Shapes / flags
+        self.latent_dim = int(latent_dim)
+        self.observation_shape = observation_shape
+        self.is_pixel = bool(is_pixel)
+        self.device = torch.device(device)
 
+        # JVP settings
+        self.ntk_samples = int(ntk_samples)
+        self.jvp_chunk_size = max(1, int(jvp_chunk_size))
+
+        # Checkpointing config
+        self.use_checkpointing = bool(use_checkpointing)
+        self.cp_critic = self.use_checkpointing if checkpoint_critic is None else bool(checkpoint_critic)
+        self.cp_jacproj = self.use_checkpointing if checkpoint_jacproj is None else bool(checkpoint_jacproj)
+        self.cp_latproj = self.use_checkpointing if checkpoint_latproj is None else bool(checkpoint_latproj)
+
+        self.robust_marginals = bool(robust_marginals)
+        self.eps = float(eps)
+
+        # ---- One-time feature probe (no JVP; no grads) ----
+        self.decoder.eval()
+        self.feature_extractor.eval()
+        with torch.no_grad():
+            dummy_z = torch.zeros(1, self.latent_dim, device=self.device)
+            dummy_x = self.decoder(dummy_z)  # [1, D] or [1, C, H, W]
+            if self.is_pixel:
+                f = self.feature_extractor(dummy_x).reshape(1, -1)
+            else:
+                f = self.feature_extractor(dummy_x.reshape(1, -1)).reshape(1, -1)
+            self._feat_dim = int(f.shape[-1])
+
+        jacobian_dim = self.ntk_samples * self._feat_dim
+
+        # Projectors + critic
         self.jacobian_projector = nn.Sequential(
             nn.Linear(jacobian_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, 256),
+            nn.LeakyReLU(negative_slope=0.1, inplace=True),
+            nn.Linear(hidden_dim, jac_dim),
         )
-
-        # Latent feature processor
-        self.latent_processor = nn.Sequential(
-            nn.Linear(latent_dim, 128), nn.ReLU(), nn.Linear(128, 128)
+        self.latent_projector = nn.Sequential(
+            nn.Linear(self.latent_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.LeakyReLU(negative_slope=0.1, inplace=True),
+            nn.Linear(hidden_dim, latent_proj_dim),
         )
-
-        # MINE statistics network
-        self.mine_network = nn.Sequential(
-            nn.Linear(spatial_aggregator_output_dim + 128, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
+        self.critic = nn.Sequential(
+            nn.Linear(jac_dim + latent_proj_dim, hidden_dim),
+            nn.LeakyReLU(negative_slope=0.1, inplace=True),
             nn.Linear(hidden_dim, 1),
         )
 
-        # EMA for stable MINE training
-        self.register_buffer("running_mean", torch.tensor(0.0))
-        self.alpha = 0.01
+        # Logging helpers
+        self.register_buffer("running_mean", torch.tensor(0.0), persistent=True)
+        self.register_buffer("ema_decay", torch.tensor(0.99), persistent=True)
+
+        self.train()
         self.to(self.device)
 
-    def to(self, device):
-        """Override to ensure proper device movement"""
-        super().to(device)
-        self.device = (
-            device if isinstance(device, torch.device) else torch.device(device)
-        )
+    def to(self, device: Union[str, torch.device]):  # type: ignore[override]
+        ret = super().to(device)
+        self.device = torch.device(device)
+        return ret
 
-        # Ensure decoder is also moved properly
-        if isinstance(self.decoder, nn.ModuleList):
-            for i in range(len(self.decoder)):
-                self.decoder[i] = self.decoder[i].to(device)
-        else:
-            self.decoder = self.decoder.to(device)
-
-        return self
-
-    def compute_jacobian_features(self, z: torch.Tensor, jvp_smoothing_sigma: float = 0.0) -> torch.Tensor:
+    # ---------- helpers ----------
+    @staticmethod
+    def _maybe_checkpoint(mod: nn.Module, x: torch.Tensor, use_cp: bool) -> torch.Tensor:
         """
-        Exact, vectorized JVP features:
-        - Uses linearize once 
-        - Optional smoothing: evaluate at z+η (η~N(0,σ^2))
-        - Orthonormal directions to reduce redundancy
+        Checkpoint only if requested AND at least one input requires grad.
         """
-        z = z.to(self.device)
-        B, Dz = z.shape
-        N = int(self.ntk_samples)
+        if use_cp and isinstance(x, torch.Tensor) and x.requires_grad:
+            return torch.utils.checkpoint.checkpoint(mod, x, use_reentrant=False)
+        return mod(x)
 
-        was_training = self.decoder.training
-        self.decoder.eval()
-        decoder_dtype = next(self.decoder.parameters()).dtype
-        z = z.to(decoder_dtype)
-        # --- directions: orthonormal across N for each batch (if Dz>=N) ---
-        # Draw a random Gaussian matrix and QR it; batched QR is supported.
-        M = torch.randn(B, Dz, N, device=self.device, dtype=decoder_dtype)    # [B,Dz,N]
-        Q, _ = torch.linalg.qr(M, mode="reduced")                        # [B,Dz,N], orthonormal columns
-        v = Q.permute(2, 0, 1).contiguous()                              # [N,B,Dz]
-        # If Dz < N, fall back to normalized random:
-        if Dz < N:
-            v = torch.randn(N, B, Dz, device=self.device, dtype=decoder_dtype)
-            v = v / (v.norm(dim=-1, keepdim=True) + torch.finfo(decoder_dtype).eps)
-
-        # Optional smoothing of the base point
-        if jvp_smoothing_sigma > 0.0:
-            eta = jvp_smoothing_sigma * torch.randn_like(z, dtype=decoder_dtype, device=self.device)
-            z_base = z + eta
+    def _encode_obs_features(self, obs: torch.Tensor) -> torch.Tensor:
+        """
+        obs: [N, B, *] JVP outputs; returns [N, B, F]. No grads through encoder.
+        """
+        N, B = obs.shape[:2]
+        if self.is_pixel:
+            x = obs.reshape(N * B, *obs.shape[2:])
+            with torch.inference_mode():
+                feats = self.feature_extractor(x).reshape(N, B, -1)
         else:
-            z_base = z
+            x = obs.reshape(N * B, -1)
+            with torch.inference_mode():
+                feats = self.feature_extractor(x).reshape(N, B, -1)
+        return feats
 
-        def f(z_in: torch.Tensor):
-            return self.decoder(z_in)
+    # ---------- JVP via fwAD (loop per direction; chunked) ----------
+    def _compute_chunked_jvp(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        z: [B, Dz]  ->  returns [B, ntk_samples * F]
+        """
+        B = z.shape[0]
+        N = self.ntk_samples
+        F = self._feat_dim
 
-        device_type = "cuda" if z.is_cuda else "cpu"
-        with torch.no_grad(), torch.amp.autocast(device_type=device_type, dtype=decoder_dtype, enabled=z.is_cuda):
-            # One forward to capture the linearization; ignore the primal output.
-            _, jvp_fn = linearize(f, z_base.to(decoder_dtype))          # jvp_fn: R^{B×Dz} → R^{B×...}
-            Jv = vmap(jvp_fn)(v).detach()             # [N,B,...]
+        out = z.new_zeros(B, N * F)
 
-        # ----- turn Jv into features via your pipelines -----
-        if Jv.dim() == 5:  # [N,B,C,H,W] (pixels)
-            N_, B_, C, H, W = Jv.shape
-            assert (N_, B_) == (N, B)
-            x = self.pixel_processor(Jv.reshape(N * B, C, H, W))  # [N*B, 128, 21, 21]
-            spatial_feats, _ = self.spatial_aggregator(x)         # [N*B, S]
-            spatial_feats = spatial_feats.view(N, B, -1)          # [N,B,S]
-            jacobian_features = spatial_feats.permute(1, 0, 2).reshape(B, -1)  # [B, N*S]
-        else:                 # [N,B,Df] (states)
-            N_, B_, Df = Jv.shape
-            assert (N_, B_) == (N, B)
-            feats = self.feature_extractor(Jv.reshape(N * B, Df))  # [N*B, H/2]
-            feats = feats.view(N, B, -1)                           # [N,B,H/2]
-            jacobian_features = feats.permute(1, 0, 2).reshape(B, -1)  # [B, N*(H/2)]
+        # Random unit directions (N, B, Dz)
+        dirs = torch.randn(N, B, self.latent_dim, device=self.device)
+        dirs = dirs / (dirs.norm(dim=-1, keepdim=True) + 1e-8)
 
-        if was_training:
-            self.decoder.train()
+        z = z.contiguous()
 
-        # Project; no checkpointing needed (inputs don't require grad)
-        return self.jacobian_projector(jacobian_features)
+        def f(latent: torch.Tensor) -> torch.Tensor:
+            return self.decoder(latent)
 
+        was_train = self.feature_extractor.training
+        self.feature_extractor.eval()
+
+        start = 0
+        while start < N:
+            end = min(start + self.jvp_chunk_size, N)
+            v_chunk = dirs[start:end].contiguous()  # [n, B, Dz]
+            n = v_chunk.shape[0]
+
+            jvp_list = []
+            for i in range(n):
+                v_in = v_chunk[i].contiguous()  # [B, Dz]
+                with fwAD.dual_level():
+                    dual = fwAD.make_dual(z, v_in)
+                    y = f(dual)                       # [B, *obs]
+                    _, tangent = fwAD.unpack_dual(y)  # [B, *obs]
+                jvp_list.append(tangent)
+
+            Jv = torch.stack(jvp_list, dim=0)              # [n, B, *obs]
+            feats_nbf = self._encode_obs_features(Jv)      # [n, B, F]
+            block = feats_nbf.permute(1, 0, 2).reshape(B, n * F)
+            out[:, start * F : start * F + n * F] = block
+
+            del v_chunk, jvp_list, Jv, feats_nbf, block
+            start = end
+        del dirs
+        if was_train:
+            self.feature_extractor.train()
+
+        return out  # [B, N*F]
+
+    # ---------- Forward: MINE-DV lower bound ----------
     def forward(
         self,
-        next_latent_mean: torch.Tensor,
-        next_latent_logvar: torch.Tensor,
+        next_latent_mean: torch.Tensor,   # [B, Dz]
+        next_latent_logvar: torch.Tensor, # [B, Dz]
         num_samples: int = 5,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        Estimates epistemic value I(o; θ | z) using MINE
+        I ≈ E_joint[T] - log E_marg[exp(T)]
+        Returns per-batch scalar replicated to [B].
         """
-        batch_size = next_latent_mean.shape[0]
-        next_latent_mean = next_latent_mean.to(self.device)
-        next_latent_logvar = next_latent_logvar.to(self.device)
+        B, Dz = next_latent_mean.shape
+        device = self.device
 
-        # Sample latent states
-        eps = torch.randn(num_samples, batch_size, self.latent_dim, device=self.device)
-        z_samples = next_latent_mean.unsqueeze(0) + eps * torch.exp(
-            0.5 * next_latent_logvar.unsqueeze(0)
-        )
-        z_all = z_samples.reshape(-1, self.latent_dim)  # (B*num_samples, latent_dim)
+        # Sample z ~ N(mean, diag(exp(logvar)))
+        eps = torch.randn(num_samples, B, Dz, device=device)
+        std = torch.exp(0.5 * next_latent_logvar.unsqueeze(0))
+        z_samples = next_latent_mean.unsqueeze(0) + eps * std
+        z_samples = z_samples.reshape(num_samples * B, Dz).contiguous()  # [S*B, Dz]
+        del eps, std
+        # Project JVP features (inputs may or may not require grad)
+        jac_feats = self._compute_chunked_jvp(z_samples)                        # [S*B, N*F]
+        jac_proj = self._maybe_checkpoint(self.jacobian_projector,          # [S*B, jac_dim]
+                                          jac_feats, self.cp_jacproj)
+        del jac_feats
+        # Latent projection
+        lat_proj = self._maybe_checkpoint(self.latent_projector,            # [S*B, lat_dim]
+                                          z_samples, self.cp_latproj)
 
-        # Compute Jacobian features (function-space representation)
-        jacobian_features = self.compute_jacobian_features(z_all, jvp_smoothing_sigma=0.00001)
+        # Critic on joint pairs
+        joint_in = torch.cat([jac_proj, lat_proj], dim=-1)                  # [S*B, *]
+        t_joint = self._maybe_checkpoint(self.critic, joint_in, self.cp_critic).squeeze(-1)
 
-        # Process latent features
-        latent_features = self.latent_processor(z_all)
-
-        # Combine features for MINE
-        combined_features = torch.cat([jacobian_features, latent_features], dim=1)
-
-        # MINE estimation with proper permutation
-        if self.use_gradient_checkpointing:
-            t_joint = torch.utils.checkpoint.checkpoint(
-                self.mine_network, combined_features, use_reentrant=False
-            )
+        # Critic on marginal pairs
+        if self.robust_marginals:
+            jac_perm = torch.randperm(jac_proj.shape[0], device=device)
+            lat_perm = torch.randperm(lat_proj.shape[0], device=device)
+            marg_in = torch.cat([jac_proj[jac_perm], lat_proj[lat_perm]], dim=-1)
         else:
-            t_joint = self.mine_network(combined_features)
+            perm = torch.randperm(jac_proj.shape[0], device=device)
+            marg_in = torch.cat([jac_proj, lat_proj[perm]], dim=-1)
+        t_marg = self._maybe_checkpoint(self.critic, marg_in, self.cp_critic).squeeze(-1)
 
-        # Create marginal by permuting within batch
-        jacobian_features_reshaped = jacobian_features.view(num_samples, batch_size, -1)
+        # DV bound with tiny eps for numerical stability
+        t_joint_mean = t_joint.mean()
+        t_marg_logmeanexp = torch.logsumexp(t_marg, dim=0) - math.log(t_marg.numel() + self.eps)
+        mi_lower_bound = t_joint_mean - t_marg_logmeanexp
 
-        # Generate random permutations for each sample
-        # Create a base index tensor
-        base_idx = (
-            torch.arange(batch_size, device=self.device)
-            .unsqueeze(0)
-            .expand(num_samples, -1)
-        )
+        # EMA for logging
+        self.running_mean = self.ema_decay * self.running_mean + (1 - self.ema_decay) * mi_lower_bound.detach()
 
-        # Apply different permutation to each sample
-        perms = torch.stack(
-            [torch.randperm(batch_size, device=self.device) for _ in range(num_samples)]
-        )
+        epistemic_value = mi_lower_bound.expand(B)
 
-        # Apply permutations using gather
-        jacobian_marginal = jacobian_features_reshaped.gather(
-            1, perms.unsqueeze(-1).expand(-1, -1, jacobian_features_reshaped.size(-1))
-        )
-        jacobian_marginal = jacobian_marginal.reshape(
-            -1, jacobian_features_reshaped.size(-1)
-        )
-
-        # Marginal features
-        combined_marginal = torch.cat([jacobian_marginal, latent_features], dim=1)
-        if self.use_gradient_checkpointing:
-            t_marginal = torch.utils.checkpoint.checkpoint(
-                self.mine_network, combined_marginal, use_reentrant=False
-            )
-        else:
-            t_marginal = self.mine_network(combined_marginal)
-
-        # MINE lower bound with EMA
-        t_marginal_logsumexp, self.running_mean = ema_loss(
-            t_marginal, self.running_mean, self.alpha
-        )
-
-        mi_lower_bound = t_joint.mean() - t_marginal_logsumexp
-
-        # Average over samples and ensure proper shape
-        epistemic_value = mi_lower_bound.expand(batch_size)
-
-        # Prepare metrics for logging
         metrics = {
-            "epistemic/mi_estimate": mi_lower_bound.item(),
-            "epistemic/joint_term": t_joint.mean().item(),
-            "epistemic/marginal_term": t_marginal_logsumexp.item(),
-            "epistemic/running_mean": self.running_mean.item(),
+            "epistemic/mi_estimate": float(mi_lower_bound.detach().cpu()),
+            "epistemic/joint_mean": float(t_joint_mean.detach().cpu()),
+            "epistemic/marg_logmeanexp": float(t_marg_logmeanexp.detach().cpu()),
+            "epistemic/running_mean": float(self.running_mean.detach().cpu()),
+            "epistemic/ntk_samples": self.ntk_samples,
+            "epistemic/jvp_chunk_size": self.jvp_chunk_size,
+            "epistemic/feat_dim": self._feat_dim,
+            "epistemic/checkpoint": int(self.use_checkpointing),
+            "epistemic/robust_marginals": int(self.robust_marginals),
         }
-
         return torch.clamp(epistemic_value, min=0.0), metrics
