@@ -62,7 +62,7 @@ class ActiveInferenceConfig:
     hidden_dim: int = 128
     latent_dim: int = 96
     spatial_aggregator_output_dim:int = 32
-    num_layers: int = 3
+    num_layers: int = 2
     pixel_observation: bool = False  # Use pixel observations
     # Training
     batch_size: int = 256

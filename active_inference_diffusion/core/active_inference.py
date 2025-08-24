@@ -6,8 +6,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.func import vmap, linearize
-from torch.autograd import forward_ad as fwAD
+import torch.utils.checkpoint as cp
+from torch.func import linearize
 import numpy as np
 from typing import Dict, Tuple, Optional, Union, Any
 from ..configs import ActiveInferenceConfig
@@ -38,7 +38,8 @@ class DiffusionActiveInference(nn.Module):
         latent_dim: int,
         config: "ActiveInferenceConfig",
         pixel_shape: Optional[Tuple[int, int, int]] = None,
-        shared_visual_encoder: Optional[nn.Module] = None
+        shared_visual_encoder: Optional[nn.Module] = None,
+        checkpoint_decoder: bool = True,
     ):
         super().__init__()
 
@@ -55,7 +56,7 @@ class DiffusionActiveInference(nn.Module):
             self.raw_observation_shape = pixel_shape
         else:
             self.raw_observation_shape = None
-
+        self.ckpt_decoder = checkpoint_decoder
         # Initialize components
         self._build_models()
         self.to(self.device)
@@ -347,21 +348,34 @@ class DiffusionActiveInference(nn.Module):
                             If False, decode to encoded feature space.
         """
         latent = latent.to(self.device)
+        use_checkpointing = self.ckpt_decoder and latent.requires_grad
         if self.is_pixel_observation:
             if decode_to_pixels:
                 # Decode to pixel space
-                return self.observation_decoder(latent)
+                if use_checkpointing:
+                    return cp.checkpoint(self.observation_decoder, latent)
+                else:
+                    return self.observation_decoder(latent)
             else:
                 # Decode to feature space (for reconstruction loss)
                 self.feature_decoder = self.feature_decoder.to(self.device)
-                return self.feature_decoder(latent)
+                if use_checkpointing:
+                    return cp.checkpoint(self.feature_decoder, latent)
+                else:
+                    return self.feature_decoder(latent)
         else:
             # For non-pixel observations, use fully connected decoder
             h = latent
-            h1 = self.observation_decoder[0](h)
-            h2 = self.observation_decoder[1](h1)
-            h2 = h2 + h1  # Skip connection
-            h3 = self.observation_decoder[2](h2)
+            if use_checkpointing:
+                h1 = cp.checkpoint(self.observation_decoder[0], h)
+                h2 = cp.checkpoint(self.observation_decoder[1], h1)
+                h2 = h2 + h1  # Skip connection
+                h3 = cp.checkpoint(self.observation_decoder[2], h2)
+            else:
+                h1 = self.observation_decoder[0](h)
+                h2 = self.observation_decoder[1](h1)
+                h2 = h2 + h1  # Skip connection
+                h3 = self.observation_decoder[2](h2)
             return self.observation_decoder[3](h3)
 
     def predict_reward_from_latent(
@@ -1187,6 +1201,8 @@ class FunctionSpaceEpistemicEstimator(nn.Module):
     Forward returns a per-batch epistemic score based on a MINE-DV lower bound:
        I(Z; Φ(J_z f)) ≈ E_joint[T] - log E_marg[exp T]
     where Φ encodes JVPs of f (decoder) along random directions in z-space.
+
+    Returns a per-batch epistemic score (MINE-DV bound) and metrics.
     """
 
     def __init__(
@@ -1199,7 +1215,7 @@ class FunctionSpaceEpistemicEstimator(nn.Module):
         is_pixel: bool,
         device: Union[str, torch.device] = "cuda",
         ntk_samples: int = 3,
-        jvp_chunk_size: int = 1,
+        jvp_chunk_size: int = 2,
         hidden_dim: int = 256,
         jac_dim: int = 128,
         latent_proj_dim: int = 128,
@@ -1208,11 +1224,11 @@ class FunctionSpaceEpistemicEstimator(nn.Module):
         checkpoint_jacproj: Union[bool, None] = None,
         checkpoint_latproj: Union[bool, None] = None,
         robust_marginals: bool = False,
-        eps: float = torch.finfo(torch.float32).eps,
+        eps: float = torch.finfo(torch.float16).eps,
     ) -> None:
         super().__init__()
 
-        # External modules
+        # External modules (you provide them)
         self.decoder = decoder
         self.feature_extractor = feature_extractor
 
@@ -1235,7 +1251,7 @@ class FunctionSpaceEpistemicEstimator(nn.Module):
         self.robust_marginals = bool(robust_marginals)
         self.eps = float(eps)
 
-        # ---- One-time feature probe (no JVP; no grads) ----
+        # ---- One-time feature probe (no grads; not doing JVP here) ----
         self.decoder.eval()
         self.feature_extractor.eval()
         with torch.no_grad():
@@ -1249,22 +1265,22 @@ class FunctionSpaceEpistemicEstimator(nn.Module):
 
         jacobian_dim = self.ntk_samples * self._feat_dim
 
-        # Projectors + critic
+        # Projectors + critic (cheap ReLU; no AMP)
         self.jacobian_projector = nn.Sequential(
             nn.Linear(jacobian_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.LeakyReLU(negative_slope=0.1, inplace=True),
+            nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, jac_dim),
         )
         self.latent_projector = nn.Sequential(
             nn.Linear(self.latent_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.LeakyReLU(negative_slope=0.1, inplace=True),
+            nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, latent_proj_dim),
         )
         self.critic = nn.Sequential(
             nn.Linear(jac_dim + latent_proj_dim, hidden_dim),
-            nn.LeakyReLU(negative_slope=0.1, inplace=True),
+            nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, 1),
         )
 
@@ -1272,22 +1288,24 @@ class FunctionSpaceEpistemicEstimator(nn.Module):
         self.register_buffer("running_mean", torch.tensor(0.0), persistent=True)
         self.register_buffer("ema_decay", torch.tensor(0.99), persistent=True)
 
+        # Default back to training mode for user modules
         self.train()
         self.to(self.device)
 
+    # ---------- utils ----------
     def to(self, device: Union[str, torch.device]):  # type: ignore[override]
         ret = super().to(device)
         self.device = torch.device(device)
         return ret
 
-    # ---------- helpers ----------
     @staticmethod
     def _maybe_checkpoint(mod: nn.Module, x: torch.Tensor, use_cp: bool) -> torch.Tensor:
         """
         Checkpoint only if requested AND at least one input requires grad.
+        (PyTorch checkpoint needs a grad-requiring tensor input.)
         """
         if use_cp and isinstance(x, torch.Tensor) and x.requires_grad:
-            return torch.utils.checkpoint.checkpoint(mod, x, use_reentrant=False)
+            return cp.checkpoint(mod, x)
         return mod(x)
 
     def _encode_obs_features(self, obs: torch.Tensor) -> torch.Tensor:
@@ -1305,10 +1323,11 @@ class FunctionSpaceEpistemicEstimator(nn.Module):
                 feats = self.feature_extractor(x).reshape(N, B, -1)
         return feats
 
-    # ---------- JVP via fwAD (loop per direction; chunked) ----------
+    # ---------- JVP via torch.func.linearize (chunked tangents) ----------
     def _compute_chunked_jvp(self, z: torch.Tensor) -> torch.Tensor:
         """
         z: [B, Dz]  ->  returns [B, ntk_samples * F]
+        Uses `linearize(self.decoder, z)` once, then applies jvp_fn to batched directions.
         """
         B = z.shape[0]
         N = self.ntk_samples
@@ -1320,11 +1339,14 @@ class FunctionSpaceEpistemicEstimator(nn.Module):
         dirs = torch.randn(N, B, self.latent_dim, device=self.device)
         dirs = dirs / (dirs.norm(dim=-1, keepdim=True) + 1e-8)
 
+        # Make sure z is contiguous for the linearization
         z = z.contiguous()
 
-        def f(latent: torch.Tensor) -> torch.Tensor:
-            return self.decoder(latent)
+        # Linearize decoder at z once; jvp_fn(v) returns J(z) @ v (same shape as decoder(z))
+        # Do not wrap in no_grad; we want the primal trace for JVP.
+        _, jvp_fn = linearize(self.decoder, z)
 
+        # Keep feature_extractor stable (no BN/Dropout drift)
         was_train = self.feature_extractor.training
         self.feature_extractor.eval()
 
@@ -1334,23 +1356,23 @@ class FunctionSpaceEpistemicEstimator(nn.Module):
             v_chunk = dirs[start:end].contiguous()  # [n, B, Dz]
             n = v_chunk.shape[0]
 
+            # Apply JVP per direction (sequential to cap memory)
             jvp_list = []
             for i in range(n):
-                v_in = v_chunk[i].contiguous()  # [B, Dz]
-                with fwAD.dual_level():
-                    dual = fwAD.make_dual(z, v_in)
-                    y = f(dual)                       # [B, *obs]
-                    _, tangent = fwAD.unpack_dual(y)  # [B, *obs]
+                v_in = v_chunk[i]  # [B, Dz]
+                tangent = jvp_fn(v_in)  # [B, *obs]
                 jvp_list.append(tangent)
 
-            Jv = torch.stack(jvp_list, dim=0)              # [n, B, *obs]
-            feats_nbf = self._encode_obs_features(Jv)      # [n, B, F]
-            block = feats_nbf.permute(1, 0, 2).reshape(B, n * F)
+            # Stack to [n, B, *obs] then encode to features
+            Jv = torch.stack(jvp_list, dim=0)
+            feats_nbf = self._encode_obs_features(Jv)                   # [n, B, F]
+            block = feats_nbf.permute(1, 0, 2).reshape(B, n * F)        # [B, n*F]
             out[:, start * F : start * F + n * F] = block
 
+            # Cleanup
             del v_chunk, jvp_list, Jv, feats_nbf, block
             start = end
-        del dirs
+
         if was_train:
             self.feature_extractor.train()
 
@@ -1374,35 +1396,35 @@ class FunctionSpaceEpistemicEstimator(nn.Module):
         eps = torch.randn(num_samples, B, Dz, device=device)
         std = torch.exp(0.5 * next_latent_logvar.unsqueeze(0))
         z_samples = next_latent_mean.unsqueeze(0) + eps * std
-        z_samples = z_samples.reshape(num_samples * B, Dz).contiguous()  # [S*B, Dz]
-        del eps, std
-        # Project JVP features (inputs may or may not require grad)
-        jac_feats = self._compute_chunked_jvp(z_samples)                        # [S*B, N*F]
-        jac_proj = self._maybe_checkpoint(self.jacobian_projector,          # [S*B, jac_dim]
-                                          jac_feats, self.cp_jacproj)
-        del jac_feats
-        # Latent projection
-        lat_proj = self._maybe_checkpoint(self.latent_projector,            # [S*B, lat_dim]
-                                          z_samples, self.cp_latproj)
+        z_all = z_samples.reshape(num_samples * B, Dz).contiguous()  # [S*B, Dz]
+
+        # JVP features → projector (checkpoint if enabled & grad flows)
+        jac_feats = self._compute_chunked_jvp(z_all)                        # [S*B, N*F]
+        jac_proj  = self._maybe_checkpoint(self.jacobian_projector,
+                                           jac_feats, self.cp_jacproj)      # [S*B, jac_dim]
+
+        # Latent projection (with grads)
+        lat_proj  = self._maybe_checkpoint(self.latent_projector,
+                                           z_all, self.cp_latproj)          # [S*B, lat_dim]
 
         # Critic on joint pairs
-        joint_in = torch.cat([jac_proj, lat_proj], dim=-1)                  # [S*B, *]
-        t_joint = self._maybe_checkpoint(self.critic, joint_in, self.cp_critic).squeeze(-1)
+        joint_in  = torch.cat([jac_proj, lat_proj], dim=-1)                  # [S*B, *]
+        t_joint   = self._maybe_checkpoint(self.critic, joint_in, self.cp_critic).squeeze(-1)
 
-        # Critic on marginal pairs
+        # Critic on marginal pairs (single perm or product of marginals)
         if self.robust_marginals:
             jac_perm = torch.randperm(jac_proj.shape[0], device=device)
             lat_perm = torch.randperm(lat_proj.shape[0], device=device)
-            marg_in = torch.cat([jac_proj[jac_perm], lat_proj[lat_perm]], dim=-1)
+            marg_in  = torch.cat([jac_proj[jac_perm], lat_proj[lat_perm]], dim=-1)
         else:
-            perm = torch.randperm(jac_proj.shape[0], device=device)
-            marg_in = torch.cat([jac_proj, lat_proj[perm]], dim=-1)
-        t_marg = self._maybe_checkpoint(self.critic, marg_in, self.cp_critic).squeeze(-1)
+            perm     = torch.randperm(jac_proj.shape[0], device=device)
+            marg_in  = torch.cat([jac_proj, lat_proj[perm]], dim=-1)
+        t_marg    = self._maybe_checkpoint(self.critic, marg_in, self.cp_critic).squeeze(-1)
 
-        # DV bound with tiny eps for numerical stability
-        t_joint_mean = t_joint.mean()
+        # DV bound (stable)
+        t_joint_mean      = t_joint.mean()
         t_marg_logmeanexp = torch.logsumexp(t_marg, dim=0) - math.log(t_marg.numel() + self.eps)
-        mi_lower_bound = t_joint_mean - t_marg_logmeanexp
+        mi_lower_bound    = t_joint_mean - t_marg_logmeanexp
 
         # EMA for logging
         self.running_mean = self.ema_decay * self.running_mean + (1 - self.ema_decay) * mi_lower_bound.detach()
