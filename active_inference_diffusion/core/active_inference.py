@@ -18,7 +18,7 @@ from ..models.policy_networks import DiffusionConditionedPolicy
 from ..models.value_networks import ValueNetwork
 from ..models.dynamics_models import LatentDynamicsModel, TransformerDynamicsModel
 from .free_energy import FreeEnergyComputation
-from ..utils.util import SpatialAttentionAggregator, symexp, symlog, make_symlog_bins, twohot_encode, categorical_ce_with_soft_targets
+from ..utils.util import symexp, symlog, make_symlog_bins, twohot_encode, categorical_ce_with_soft_targets
 HiddenState = Union[Tuple[torch.Tensor, torch.Tensor], Dict[str, torch.Tensor], None]
 
 class DiffusionActiveInference(nn.Module):
@@ -40,6 +40,7 @@ class DiffusionActiveInference(nn.Module):
         pixel_shape: Optional[Tuple[int, int, int]] = None,
         shared_visual_encoder: Optional[nn.Module] = None,
         checkpoint_decoder: bool = True,
+        checkpoint_reward_predictor: bool = True,
     ):
         super().__init__()
 
@@ -57,6 +58,7 @@ class DiffusionActiveInference(nn.Module):
         else:
             self.raw_observation_shape = None
         self.ckpt_decoder = checkpoint_decoder
+        self.ckpt_reward_predictor = checkpoint_reward_predictor
         # Initialize components
         self._build_models()
         self.to(self.device)
@@ -96,7 +98,6 @@ class DiffusionActiveInference(nn.Module):
             latent_dim=self.latent_dim,
             action_dim=self.action_dim,
             hidden_dim=self.config.hidden_dim,
-            use_state_dependent_std=True,
             squash_output=True
         )
 
@@ -105,9 +106,11 @@ class DiffusionActiveInference(nn.Module):
         self.value_network = ValueNetwork(
             state_dim=self.latent_dim,  # Using latent dimension as state dimension
             hidden_dim=self.config.hidden_dim,
-            time_embed_dim=128,  # Time embedding dimension
-            num_layers=3,
+            num_layers=self.config.value_net_num_layers,
+            num_bins=self.config.num_value_bins,
         )
+        self.register_buffer("value_bins_symlog", self.value_network.bins_symlog, persistent=False)
+        self.register_buffer("value_bins_real",   self.value_network.bins_real,   persistent=False)
 
         # Dynamics model in latent space
         if self.config.dynamics_type == "transformer":
@@ -216,11 +219,9 @@ class DiffusionActiveInference(nn.Module):
             nn.Linear(self.latent_dim, self.config.hidden_dim),
             nn.LayerNorm(self.config.hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.1),
             nn.Linear(self.config.hidden_dim, self.config.hidden_dim // 2),
             nn.LayerNorm(self.config.hidden_dim // 2),
             nn.ReLU(),
-            nn.Dropout(0.1),
             nn.Linear(self.config.hidden_dim // 2, self.num_reward_bins),
         )
         nn.init.zeros_(self.reward_predictor[-1].weight)
@@ -312,28 +313,45 @@ class DiffusionActiveInference(nn.Module):
             return out
         return h
 
-    def _blend_hidden(self, old: HiddenState, new: HiddenState, done: torch.Tensor) -> HiddenState:
+
+    def _blend_hidden(self, new: HiddenState, done: torch.Tensor) -> HiddenState:
         """
         Keep `new` where not done, insert a freshly reset hidden where done.
         (Useful if you want to combine step output with per-env resets.)
         """
         if new is None:
             return None
+
+        # LSTM hidden: tuple(h, c) with shapes [L, B, H]
         if isinstance(new, tuple):
-            dm = done.float().view(1, -1, 1)
-            reset = self.reset_dynamics_hidden(new[0].size(1))  # batch size from hidden
-            return (reset[0] * dm + new[0] * (1.0 - dm),
-                    reset[1] * dm + new[1] * (1.0 - dm))
+            h, c = new
+            # mask shape: [1, B, 1] to broadcast across layers & hidden dim
+            dm = done.to(h.dtype).view(1, -1, 1)
+            # get a fresh reset state for this batch size
+            reset_h, reset_c = self.reset_dynamics_hidden(h.size(1))
+            # blend: reset where done=1, keep new where done=0
+            h = reset_h * dm + h * (1.0 - dm)
+            c = reset_c * dm + c * (1.0 - dm)
+            return (h, c)
+
+        # Dict-style hidden (e.g., token caches, lengths, etc.)
         if isinstance(new, dict):
-            out = {k: v.clone() for k, v in new.items()}
+            out = {k: v.clone() for k, v in new.items()}  # avoid in-place on shared graph
             idx = done.nonzero(as_tuple=False).squeeze(-1)
             if idx.numel() > 0:
                 reset = self.reset_dynamics_hidden(len(done))
-                if "tokens" in out and "tokens" in reset:
-                    out["tokens"][idx] = reset["tokens"][idx]
-                if "lengths" in out and "lengths" in reset:
-                    out["lengths"][idx] = reset["lengths"][idx]
+                # copy only for keys that exist in both; leave others untouched
+                if isinstance(reset, dict):
+                    for k in out.keys():
+                        if k in reset:
+                            out[k][idx] = reset[k][idx]
+                else:
+                    # fallback: zero the done indices if reset isn't a dict
+                    for k in out.keys():
+                        out[k][idx] = torch.zeros_like(out[k][idx])
             return out
+
+        # Fallback for other hidden types (e.g., GRU tensor) — untouched
         return new
 
     def decode_observation(
@@ -352,25 +370,25 @@ class DiffusionActiveInference(nn.Module):
         if self.is_pixel_observation:
             if decode_to_pixels:
                 # Decode to pixel space
-                if use_checkpointing:
-                    return cp.checkpoint(self.observation_decoder, latent)
+                if use_checkpointing and self.training:
+                    return cp.checkpoint(self.observation_decoder, latent, use_reentrant=False)
                 else:
                     return self.observation_decoder(latent)
             else:
                 # Decode to feature space (for reconstruction loss)
                 self.feature_decoder = self.feature_decoder.to(self.device)
-                if use_checkpointing:
-                    return cp.checkpoint(self.feature_decoder, latent)
+                if use_checkpointing and self.training:
+                    return cp.checkpoint(self.feature_decoder, latent, use_reentrant=False)
                 else:
                     return self.feature_decoder(latent)
         else:
             # For non-pixel observations, use fully connected decoder
             h = latent
-            if use_checkpointing:
-                h1 = cp.checkpoint(self.observation_decoder[0], h)
-                h2 = cp.checkpoint(self.observation_decoder[1], h1)
+            if use_checkpointing and self.training:
+                h1 = cp.checkpoint(self.observation_decoder[0], h, use_reentrant=False)
+                h2 = cp.checkpoint(self.observation_decoder[1], h1, use_reentrant=False)
                 h2 = h2 + h1  # Skip connection
-                h3 = cp.checkpoint(self.observation_decoder[2], h2)
+                h3 = cp.checkpoint(self.observation_decoder[2], h2, use_reentrant=False)
             else:
                 h1 = self.observation_decoder[0](h)
                 h2 = self.observation_decoder[1](h1)
@@ -389,7 +407,10 @@ class DiffusionActiveInference(nn.Module):
             latent = latent.unsqueeze(0)
         if torch.isnan(latent).any() or torch.isinf(latent).any():
             raise ValueError("Latent tensor contains NaN or Inf values")
-        logits = self.reward_predictor(latent)
+        if self.ckpt_reward_predictor and latent.requires_grad and self.training:
+            logits = cp.checkpoint(self.reward_predictor, latent, use_reentrant=False)
+        else:
+            logits = self.reward_predictor(latent)
         probs = F.softmax(logits, dim=-1)
         pred = (probs * self.reward_bins_real).sum(dim=-1)
 
@@ -512,7 +533,7 @@ class DiffusionActiveInference(nn.Module):
         latent: torch.Tensor,
         horizon: int = 5,
         num_trajectories: int = 6,
-        num_ambiguity_samples: int = 3,
+        num_ambiguity_samples: int = 2,
         hidden_state: HiddenState= None,
         done_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -554,16 +575,16 @@ class DiffusionActiveInference(nn.Module):
                 # Since Z is constant across policies, we can ignore it
                 predicted_reward, _ = self.predict_reward_from_latent(next_latent)
                 # This makes high-reward states preferred under EFE p(o) ∝ exp(r(o)/τ)
-                pragmatic = self.config.pragmatic_weight * (
-                    predicted_reward / self.preference_temperature
-                )
+                pragmatic = predicted_reward / self.preference_temperature
+
                 # Pragmatic value: Expected value under policy
-                time_tensor = torch.full((batch_size,), float(t), device=device)
-                value = self.value_network(next_latent, time_tensor).squeeze(-1)
-                pragmatic += value
+                
+                value = self.value_network(next_latent)                       # [B, K]
+                exceptional_value = self.value_network.expected_value(value)  # [B], ∑ p(bin)*bin_real
+                pragmatic += exceptional_value
 
                 # 2. Consistency (negative policy entropy)-> exploration bonus
-                consistency = -policy_dist.entropy().sum(dim=-1)
+                consistency = -self.policy_network.get_policy_entropy(current_latent)
 
                 epistemic, epistemic_metrics = self.compute_epistemic_value(
                     next_latent_mean,
@@ -956,7 +977,8 @@ class DiffusionActiveInference(nn.Module):
             # This is crucial for proper sequence handling!
             if done.any():
                 # Create new hidden states for completed episodes 
-                new_hidden_states = self._blend_hidden(hidden_states=new_hidden_states, old=hidden_states, done=done)
+                new_hidden_states = self._blend_hidden(new=new_hidden_states, done=done)
+
 
             hidden_states = new_hidden_states
 
@@ -974,85 +996,64 @@ class DiffusionActiveInference(nn.Module):
 
     def compute_lambda_returns(
         self,
-        rewards: torch.Tensor,
-        values: torch.Tensor,
-        next_values: torch.Tensor,
-        dones: torch.Tensor,
+        rewards: torch.Tensor,       # [B]
+        next_values: torch.Tensor,   # [B], where next_values[t] = V(s_{t+1})
+        dones: torch.Tensor,         # [B] in {0,1} for transition t -> t+1
         lambda_: float = 0.95,
         n_steps: int = 5,
         exclude_immediate_rewards: bool = False,
     ) -> torch.Tensor:
         """
-        Compute λ-returns as in Dreamer v2.
+        Correct n-step λ-returns with proper bootstrapping index:
+        G_t^(λ,n) = r_t + γ (1-d_t) [ (1-λ) V_{t+1} + λ G_{t+1} ]  (unrolled n steps)
+        where V_{t+1} = next_values[t], and the final bootstrap at horizon J
+        uses V_{t+J} = next_values[t+J-1].
 
-        The λ-return is a weighted average of n-step returns:
-        When exclude_immediate_reward=True, returns are computed without immediate rewards,
-        making the value function learn V(s) = E[Σ_{t'=t+1}^T γ^{t'-t} r_{t'}]
-        instead of V(s) = E[Σ_{t'=t}^T γ^{t'-t} r_{t'}]
+        Assumes 'batch as time' (i.e., index t+1 is the next transition in the batch).
         """
-        batch_size = rewards.shape[0]
-        device = rewards.device
+        assert rewards.device == next_values.device == dones.device
+        assert rewards.dtype == next_values.dtype
 
-        # Initialize returns storage
-        lambda_returns = torch.zeros_like(rewards).to(device)
+        B      = rewards.shape[0]
+        out    = torch.zeros_like(rewards)
+        gamma  = float(self.config.discount_factor)
+        lam    = float(lambda_)
+        one_m  = 1.0 - lam
+        dones  = dones.float()
 
-        # Compute n-step returns
-        for idx in range(batch_size):
-            returns = []
+        # scalar zero on the correct device/dtype (no grads, no 0*x)
+        zero = rewards.new_zeros(())
 
-            # Calculate different n-step returns
-            for n in range(1, min(n_steps + 1, batch_size - idx)):
-                n_step_return = 0
-                discount = 1.0
+        for t in range(B):
+            # horizon length for this start
+            J = min(int(n_steps), B - t)
+            if J <= 0:
+                out[t] = zero
+                continue
 
-                # Sum discounted rewards for n steps
-                for k in range(n):
-                    if idx + k < batch_size:
-                        if not (exclude_immediate_rewards and k == 0):
-                            n_step_return += discount * rewards[idx + k]
-                        discount *= self.config.discount_factor * (
-                            1 - dones[idx + k].float()
-                        )
+            # Bootstrap V(s_{t+J}) which is stored at next_values[t+J-1]
+            idx_boot = t + J - 1
+            if idx_boot >= B:  # defensive bound (shouldn't fire with the J formula above)
+                idx_boot = B - 1
+            G = next_values[idx_boot]
 
-                # Add bootstrapped value
-                if idx + n < batch_size and not dones[idx + n - 1]:
-                    n_step_return += discount * next_values[idx + n]
+            # Backward recursion: k = J-1 ... 0
+            for k in range(J - 1, -1, -1):
+                idx = t + k
 
-                returns.append(n_step_return)
+                r = rewards[idx]
+                if exclude_immediate_rewards and k == 0:
+                    r = zero  # cleaner than 0.0 * rewards[idx]
 
-            # Compute weighted average with λ
-            if returns:
-                weighted_return = 0
-                lambda_sum = 0
+                m  = 1.0 - dones[idx]      # stop bootstrapping at terminals
+                v1 = next_values[idx]      # V(s_{idx+1})
 
-                for i, ret in enumerate(returns[:-1]):
-                    weight = (1 - lambda_) * (lambda_**i)
-                    weighted_return += weight * ret
-                    lambda_sum += weight
+                # G_k = r_k + γ m_k [ (1-λ) V_{k+1} + λ G_{k+1} ]
+                G = r + gamma * m * (one_m * v1 + lam * G)
 
-                # Last return gets remaining weight
-                if len(returns) > 0:
-                    last_weight = lambda_ ** (len(returns) - 1)
-                    weighted_return += last_weight * returns[-1]
-                    lambda_sum += last_weight
+            out[t] = G
 
-                lambda_returns[idx] = weighted_return / (lambda_sum + torch.finfo(torch.float32).eps)
-            else:
-                if exclude_immediate_rewards:
-                    lambda_returns[idx] = (
-                        self.config.discount_factor
-                        * (1 - dones[idx].float())
-                        * next_values[idx]
-                    )
-                else:
-                    lambda_returns[idx] = (
-                        rewards[idx]
-                        + self.config.discount_factor
-                        * (1 - dones[idx].float())
-                        * next_values[idx]
-                    )
-
-        return lambda_returns
+        return out
 
     def _compute_gradient_penalty(
         self, noisy_latents: torch.Tensor, t: torch.Tensor, observations: torch.Tensor,
@@ -1184,8 +1185,6 @@ def ema_loss(x, running_mean, alpha=0.01):
     return t_log, running_mean
 
 
-
-
 class FunctionSpaceEpistemicEstimator(nn.Module):
     """
     Memory-efficient epistemic estimator using JVP features of decoder outputs,
@@ -1215,7 +1214,7 @@ class FunctionSpaceEpistemicEstimator(nn.Module):
         is_pixel: bool,
         device: Union[str, torch.device] = "cuda",
         ntk_samples: int = 3,
-        jvp_chunk_size: int = 2,
+        jvp_chunk_size: int = 1,
         hidden_dim: int = 256,
         jac_dim: int = 128,
         latent_proj_dim: int = 128,
@@ -1305,7 +1304,7 @@ class FunctionSpaceEpistemicEstimator(nn.Module):
         (PyTorch checkpoint needs a grad-requiring tensor input.)
         """
         if use_cp and isinstance(x, torch.Tensor) and x.requires_grad:
-            return cp.checkpoint(mod, x)
+            return cp.checkpoint(mod, x, use_reentrant=False)
         return mod(x)
 
     def _encode_obs_features(self, obs: torch.Tensor) -> torch.Tensor:
@@ -1369,13 +1368,12 @@ class FunctionSpaceEpistemicEstimator(nn.Module):
             block = feats_nbf.permute(1, 0, 2).reshape(B, n * F)        # [B, n*F]
             out[:, start * F : start * F + n * F] = block
 
-            # Cleanup
-            del v_chunk, jvp_list, Jv, feats_nbf, block
             start = end
-
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         if was_train:
             self.feature_extractor.train()
-
+        del dirs
         return out  # [B, N*F]
 
     # ---------- Forward: MINE-DV lower bound ----------
@@ -1396,30 +1394,38 @@ class FunctionSpaceEpistemicEstimator(nn.Module):
         eps = torch.randn(num_samples, B, Dz, device=device)
         std = torch.exp(0.5 * next_latent_logvar.unsqueeze(0))
         z_samples = next_latent_mean.unsqueeze(0) + eps * std
-        z_all = z_samples.reshape(num_samples * B, Dz).contiguous()  # [S*B, Dz]
+        z_samples = z_samples.reshape(num_samples * B, Dz).contiguous()  # [S*B, Dz]
 
         # JVP features → projector (checkpoint if enabled & grad flows)
-        jac_feats = self._compute_chunked_jvp(z_all)                        # [S*B, N*F]
+        jac_feats = self._compute_chunked_jvp(z_samples)                        # [S*B, N*F]
         jac_proj  = self._maybe_checkpoint(self.jacobian_projector,
                                            jac_feats, self.cp_jacproj)      # [S*B, jac_dim]
 
         # Latent projection (with grads)
         lat_proj  = self._maybe_checkpoint(self.latent_projector,
-                                           z_all, self.cp_latproj)          # [S*B, lat_dim]
+                                           z_samples, self.cp_latproj)          # [S*B, lat_dim]
 
         # Critic on joint pairs
         joint_in  = torch.cat([jac_proj, lat_proj], dim=-1)                  # [S*B, *]
         t_joint   = self._maybe_checkpoint(self.critic, joint_in, self.cp_critic).squeeze(-1)
 
         # Critic on marginal pairs (single perm or product of marginals)
-        if self.robust_marginals:
-            jac_perm = torch.randperm(jac_proj.shape[0], device=device)
-            lat_perm = torch.randperm(lat_proj.shape[0], device=device)
-            marg_in  = torch.cat([jac_proj[jac_perm], lat_proj[lat_perm]], dim=-1)
+        def _marg_block(jac, lat):
+            # jac, lat: [S*B, D]
+            if self.robust_marginals:
+                jac_perm = torch.randperm(jac.shape[0], device=jac.device)
+                lat_perm = torch.randperm(lat.shape[0], device=lat.device)
+                m = torch.cat([jac[jac_perm], lat[lat_perm]], dim=-1)
+            else:
+                perm = torch.randperm(jac.shape[0], device=jac.device)
+                m = torch.cat([jac, lat[perm]], dim=-1)
+            return self.critic(m).squeeze(-1)
+
+        if self.cp_critic:
+            # use_reentrant=False preserves RNG state for recomputation
+            t_marg = cp.checkpoint(_marg_block, jac_proj, lat_proj, use_reentrant=False)
         else:
-            perm     = torch.randperm(jac_proj.shape[0], device=device)
-            marg_in  = torch.cat([jac_proj, lat_proj[perm]], dim=-1)
-        t_marg    = self._maybe_checkpoint(self.critic, marg_in, self.cp_critic).squeeze(-1)
+            t_marg = _marg_block(jac_proj, lat_proj)
 
         # DV bound (stable)
         t_joint_mean      = t_joint.mean()
@@ -1430,7 +1436,9 @@ class FunctionSpaceEpistemicEstimator(nn.Module):
         self.running_mean = self.ema_decay * self.running_mean + (1 - self.ema_decay) * mi_lower_bound.detach()
 
         epistemic_value = mi_lower_bound.expand(B)
-
+        del eps, std, z_samples, jac_feats, jac_proj, lat_proj, joint_in, t_joint, t_marg
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         metrics = {
             "epistemic/mi_estimate": float(mi_lower_bound.detach().cpu()),
             "epistemic/joint_mean": float(t_joint_mean.detach().cpu()),

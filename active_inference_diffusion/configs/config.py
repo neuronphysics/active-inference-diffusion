@@ -48,14 +48,14 @@ class ActiveInferenceConfig:
     precision_init: float = 1.0
     expected_free_energy_horizon: int = 5
     efe_horizon: int = 5  # Alias for compatibility
-    epistemic_weight: float = 0.1
+    epistemic_weight: float = 0.6
     extrinsic_weight: float = 1.0
     pragmatic_weight: float = 1.0  # 
     consistency_weight: float = 0.1  # latent policy coherence
     discount_factor: float = 0.99
     contrastive_weight: float = 0.5  # for latent policy coherence
     # Diffusion integration
-    kl_weight: float = 0.1  # kl regularization for diffusion
+    kl_weight: float = 0.9  # kl regularization for diffusion
     diffusion_weight: float = 1.0  # score matching weight
     reward_weight:float = 0.5  # reward scaling
     # Model architecture
@@ -81,11 +81,14 @@ class ActiveInferenceConfig:
     dynamics_context_len = 16
     dynamics_num_layers = 2
     dynamics_n_heads = 4
-    dynamics_dropout = 0.1
+    dynamics_dropout = 0.0
     dynamics_residual = True
     dynamics_use_checkpointing = True
     dynamics_attn_impl = "mem"       # good on 11GB cards
 
+    # Value network parameters
+    num_value_bins: int = 255  # Number of bins for categorical value distribution
+    value_net_num_layers: int = 2  # Number of hidden layers in value network
     # Preference shaping parameters
     baseline_reward: float = 0.0  # Baseline for reward centering
     preference_momentum: float = 0.9  # EMA for reward statistics    
@@ -104,6 +107,7 @@ class PixelObservationConfig:
     encoder_type: str = "drqv2"  # drqv2, impala, attention
     encoder_feature_dim: int = 80
     augmentation: bool = True
+    num_layers: int = 3
     random_shift_pad: int = 4
     pixel_observation:  bool = True  # Use pixel observations
     

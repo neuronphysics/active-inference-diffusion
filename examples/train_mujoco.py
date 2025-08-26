@@ -34,6 +34,10 @@ from active_inference_diffusion.utils.util import visualize_reconstruction
 import torch.profiler
 
 import os
+if torch.cuda.is_available():
+    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    torch.backends.cuda.enable_math_sdp(True)
 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True,max_split_size_mb:512'
 os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
@@ -168,14 +172,14 @@ def train_diffusion_active_inference(
     # Create configurations
     config = ActiveInferenceConfig(
         env_name=env_name,
-        latent_dim=36,
-        hidden_dim=32,
+        latent_dim=28,
+        hidden_dim=24,
         learning_rate=4e-5,
-        batch_size=100,
+        batch_size=60,
         efe_horizon=5,
         epistemic_weight=0.5,
         pragmatic_weight=1.0,
-        consistency_weight=0.1,
+        consistency_weight=0.5,
         kl_weight=0.75,
         diffusion_weight=1.0,
         pixel_observation=use_pixels,

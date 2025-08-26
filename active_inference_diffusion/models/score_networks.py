@@ -7,6 +7,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import Optional
+import torch.utils.checkpoint as cp
+from torch.nn.attention import SDPBackend, sdpa_kernel
+def _act(kind: str) -> nn.Module:
+    kind = kind.lower()
+    if kind == "relu":
+        return nn.ReLU(inplace=True)
+    if kind in ("lrelu", "leakyrelu"):
+        return nn.LeakyReLU(0.1, inplace=True)
+    if kind == "gelu":
+        return nn.GELU()
+    if kind == "silu" or kind == "swish":
+        return nn.SiLU(inplace=True)
+    raise ValueError(f"Unknown activation: {kind}")
+
 class FrameTimeEmbedder(nn.Module):
     def __init__(self, hidden_size, freq_dim=64):
         super().__init__()
@@ -63,6 +77,8 @@ class LatentScoreNetwork(nn.Module):
         num_layers: int = 6,
         use_attention: bool = True,
         output_scale: float = 1e-3,
+        use_checkpoint: bool = True,
+        activation: str = "silu",
     ):
         super().__init__()
         
@@ -74,11 +90,13 @@ class LatentScoreNetwork(nn.Module):
         self.mlp_ratio = 4.0
         self.use_attention = use_attention
         self.output_scale = output_scale
+        self.use_checkpoint = use_checkpoint
+        self.act =activation.lower()
         # Time embedding - FIXED to output hidden_dim
         self.time_embed = nn.Sequential(
             SinusoidalPositionEmbeddings(time_embed_dim),
             nn.Linear(time_embed_dim, hidden_dim*2),  # Changed to output hidden_dim directly
-            nn.ReLU(),
+            _act(self.act),
             nn.Linear(hidden_dim*2, hidden_dim)
         )
         
@@ -86,22 +104,20 @@ class LatentScoreNetwork(nn.Module):
         self.obs_encoder = nn.Sequential(
             nn.Linear(observation_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
+            _act(self.act),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
+            _act(self.act),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
         )
         self.continuous_time_embed = nn.Sequential(
             nn.Linear(1, time_embed_dim, bias=True),
             nn.LayerNorm(time_embed_dim),
-            nn.SiLU(),
+            _act(self.act),
             nn.Linear(time_embed_dim, time_embed_dim),
             nn.LayerNorm(time_embed_dim),
-            nn.SiLU(),
+            _act(self.act),
             nn.Linear(time_embed_dim, hidden_dim)
         )
         
@@ -132,7 +148,7 @@ class LatentScoreNetwork(nn.Module):
         self.output_proj = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.LayerNorm(hidden_dim // 2),
-            nn.ReLU(),
+            _act(self.act),
             nn.Linear(hidden_dim // 2, latent_dim, bias=False)
         )
         self.output_multiplier = nn.Parameter(torch.ones(1) * output_scale)
@@ -152,6 +168,14 @@ class LatentScoreNetwork(nn.Module):
                 nn.init.zeros_(m.bias)
     
 
+    def _maybe_cp(self, fn, *tensors, enable: bool):
+        """
+        Checkpoint only during training when enabled.
+        This is more predictable than checking requires_grad.
+        """
+        if enable and self.training:
+            return cp.checkpoint(fn, *tensors, use_reentrant=False)
+        return fn(*tensors)    
     def forward(
         self,
         z_t: torch.Tensor,
@@ -191,7 +215,8 @@ class LatentScoreNetwork(nn.Module):
             t_emb = t_sin + self.time_scale * t_cont
         
             # Add time-dependent output scaling for annealing
-            time_weight = torch.sqrt(torch.clamp(1.0 / (torch.finfo(torch.float16).eps + time.view(-1, 1)), max=10.0))
+            time_eps = torch.finfo(z_t.dtype).eps if z_t.is_floating_point() else 1e-8
+            time_weight = torch.clamp((1.0 / (time_eps + time.view(-1, 1))).sqrt(), max=10.0)
         else:
             # Discrete time path (for backward compatibility)
             t_emb = self.time_embed(time.float())
@@ -199,7 +224,9 @@ class LatentScoreNetwork(nn.Module):
 
         # Encode observation
         if observation is not None:
-            obs_emb = self.obs_encoder(observation)
+            def _obs_trunk(obs):
+                return self.obs_encoder(obs)
+            obs_emb = self._maybe_cp(_obs_trunk, observation, enable=self.use_checkpoint)
             obs_emb = F.normalize(obs_emb, dim=-1)
         else:
             # Use learned null embedding
@@ -218,13 +245,14 @@ class LatentScoreNetwork(nn.Module):
         if self.use_attention:
             # Process through DiT blocks
             for block in self.transformer_blocks:
-                h = block(h, conditioning)
+                h = self._maybe_cp(lambda x, c: block(x, c), h, conditioning, enable=self.use_checkpoint)
+
+
         
         # Final norm and output
         h = self.norm_final(h, conditioning)
-        score = self.output_proj(h)
-        score = torch.clamp(score, min=-2, max=2)
-        score = score * self.output_multiplier  # Scale output
+        score = self._maybe_cp(lambda x: self.output_proj(x), h, enable=self.use_checkpoint)
+        score = torch.clamp(score, min=-2, max=2) * self.output_multiplier  # Prevent extreme scores
         if is_continuous:
             # Apply time-dependent scaling for continuous time
             score = score * time_weight
@@ -284,7 +312,8 @@ class DiTBlock(nn.Module):
         norm_x = self.norm1(x, conditioning)
         # For single token (no sequence), we need to add sequence dimension
         norm_x = norm_x.unsqueeze(1)  # [B, 1, hidden_dim]
-        attn_out, _ = self.attention(norm_x, norm_x, norm_x)
+        with sdpa_kernel(SDPBackend.MATH):
+            attn_out, _ = self.attention(norm_x, norm_x, norm_x)
         attn_out = attn_out.squeeze(1)  # [B, hidden_dim]
         x = x + attn_out
         

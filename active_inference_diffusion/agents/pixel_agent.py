@@ -11,7 +11,7 @@ import gymnasium as gym
 from typing import Dict, Tuple, Optional, Any
 
 from .base_agent import BaseActiveInferenceAgent
-from ..core.active_inference import DiffusionActiveInference
+from ..core.active_inference import DiffusionActiveInference, EMAModel
 from ..encoder.visual_encoders import RandomShiftAugmentation, DrQV2Encoder
 from ..encoder.state_encoders import EncoderFactory
 from ..utils.buffers import ReplayBuffer, SequenceReplayBuffer
@@ -86,9 +86,14 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
             obs_shape=self.obs_shape,
             feature_dim=self.config.latent_dim,
             frame_stack=self.pixel_config.frame_stack,
-            num_layers=4,
+            num_layers=self.pixel_config.num_layers,
             num_filters=32,
-        ).to(self.device)
+            use_spectral_norm=True,
+            attention='global',
+            checkpoint_trunk=True,  
+            checkpoint_attention=True,
+            checkpoint_head=False
+            ).to(self.device)
         
         # Augmentation module
         self.augmentation = RandomShiftAugmentation(pad=self.pixel_config.random_shift_pad) if self.pixel_config.augmentation else None
@@ -103,7 +108,7 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
             pixel_shape=self.obs_shape if self.pixel_config.pixel_observation else None,
             shared_visual_encoder=self.encoder 
         )
-        
+        self.value_ema = EMAModel(self.active_inference.value_network, decay=0.9999, device=self.device)
 
         # Move all components to device
         self.encoder = self.encoder.to(self.device)
@@ -376,35 +381,42 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
         metrics['policy_loss'] = policy_loss.item()
         metrics.update(efe_info)
         
-        # 6. Train value network
+
+        # 6. Train value network (Dreamer-style symlog critic)
         self.value_optimizer.zero_grad()
 
-        batch_size = latents.shape[0]
-        time_current = torch.zeros(batch_size, device=self.device)
-        time_next = torch.ones(batch_size, device=self.device)  # Next timestep
-        values = self.active_inference.value_network(latents, time_current).squeeze(-1)
-        # Predict values with time conditioning
+        # Predict current and next value logits (no time input)
+        logits = self.active_inference.value_network(latents)                    # [B, K]
+        #Use EMA target network for bootstrapping
         with torch.no_grad():
-            next_values = self.active_inference.value_network(next_latents, time_next).squeeze(-1)
-            targets = self.active_inference.compute_lambda_returns(
-                    rewards=rewards,
-                    values=values,
-                    next_values=next_values,
-                    dones=dones,
-                    lambda_=0.95,  # TODO: can be added to config
-                    n_steps=5
-                    )
-    
-        value_loss = F.huber_loss(values, targets)
+            self.value_ema.apply_shadow()
+            next_logits = self.active_inference.value_network(next_latents)      # [B, K]
+            self.value_ema.restore()
+            # Use current critic expectation to compute λ-returns bootstrap terms
+            next_values = self.active_inference.value_network.expected_value(next_logits)# [B]
+
+            lambda_returns = self.active_inference.compute_lambda_returns(
+                rewards=rewards,
+                next_values=next_values,
+                dones=dones,
+                lambda_=0.95,
+                n_steps=5
+            )
+
+        # Main critic loss: categorical CE to two-hot symlog targets
+        value_loss = self.active_inference.value_network.loss_from_returns(logits, lambda_returns).mean()
+
+        # EMA consistency: regularize current logits to match EMA logits (small weight)
+        
+
         value_loss.backward()
-        
-        torch.nn.utils.clip_grad_norm_(
-            self.active_inference.value_network.parameters(),
-            self.config.gradient_clip
-        )
+        torch.nn.utils.clip_grad_norm_(self.active_inference.value_network.parameters(), self.config.gradient_clip)
         self.value_optimizer.step()
-        
+        self.value_ema.update()
+
         metrics['value_loss'] = value_loss.item()
+        
+
         # Train epistemic estimator separately
         if self.total_steps % 5 == 0:  # Train less frequently for stability
             epistemic_mi, epistemic_metrics = self.active_inference.train_epistemic_estimator(

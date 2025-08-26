@@ -1,7 +1,6 @@
 """
 Dynamics model implementations
 """
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -344,7 +343,7 @@ class TransformerDynamicsModel(nn.Module):
                 
                 for layer in self.encoder.layers:
                     x = torch.utils.checkpoint.checkpoint(
-                        run_layer, x, layer, causal, src_kpm, use_reentrant=True, preserve_rng_state=True
+                        run_layer, x, layer, causal, src_kpm, use_reentrant=False, preserve_rng_state=True
                     )
 
                 if self.encoder.norm is not None:
