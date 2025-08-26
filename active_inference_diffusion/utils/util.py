@@ -4,6 +4,8 @@ import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
 from typing import Optional, Union, Tuple
+import matplotlib
+matplotlib.use("Agg")
 class SpatialAttentionAggregator(nn.Module):
     """
     Multi-head attention for spatially-aware epistemic feature aggregation
@@ -145,8 +147,9 @@ def visualize_reconstruction(
                 # Check if we're dealing with frame-stacked input and single-frame output
                 is_frame_stacked_input = (orig_obs.ndim == 4 and orig_obs.shape[1] > 3) or \
                                        (orig_obs.ndim == 5)
-                is_single_frame_output = recon_obs.ndim == 4 and recon_obs.shape[1] == 3
-                
+                # supports NCHW (C==3) or NHWC (last dim == 3)
+                is_single_frame_output = (recon_obs.ndim == 4 and (recon_obs.shape[1] == 3 or recon_obs.shape[-1] == 3))
+
                 if is_frame_stacked_input and is_single_frame_output:
                     print("Detected frame-stacked input with single-frame decoder output")
                     # This is the common case - we'll compare the most recent frame
@@ -213,7 +216,7 @@ def create_mixed_reconstruction_plot(
             frames = orig.reshape(n_frames, 3, h, w)
         else:
             # Already a single frame
-            frames = orig.unsqueeze(0) if orig.ndim == 3 else orig
+            frames = np.expand_dims(orig, 0) if orig.ndim == 3 else orig
         
         # Row 1: Show frame stack as grid
         if frames.shape[0] > 1:
