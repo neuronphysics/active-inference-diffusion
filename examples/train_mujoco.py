@@ -44,22 +44,6 @@ os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
 os.environ['MUJOCO_GL'] = 'egl'
 
 
-def profile_training_step(agent, batch_data, step):
-    with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True
-    ) as prof:
-        with torch.profiler.record_function("training_step"):
-            metrics = agent.train_step()
-    
-    if step % 100 == 0:
-        print(prof.key_averages().table(sort_by="cuda_memory_usage", row_limit=10))
-        prof.export_chrome_trace(f"trace_step_{step}.json")
 
 def setup_environment(
     env_name: str,

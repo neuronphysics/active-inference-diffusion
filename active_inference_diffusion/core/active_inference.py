@@ -933,6 +933,7 @@ class DiffusionActiveInference(nn.Module):
         action_sequences: torch.Tensor,  # [batch_size, seq_len-1, action_dim]
         done_sequences: torch.Tensor,  # [batch_size, seq_len-1]
         sequence_lengths: torch.Tensor,  # [batch_size] actual lengths
+        sample_weights: Optional[torch.Tensor] = None
     ) -> Dict[str, float]:
         """
         Train dynamics with proper hidden state flow and done masking
@@ -971,7 +972,11 @@ class DiffusionActiveInference(nn.Module):
             ).sum(dim=-1)
 
             # Apply sequence mask
-            masked_nll = (nll * mask).sum() / (mask.sum() + torch.finfo(torch.float32).eps)
+            if sample_weights is not None:
+                sw = sample_weights  # [B]
+                masked_nll = ( (nll * mask) * sw ).sum() / ((mask * sw).sum() + torch.finfo(torch.float32).eps)
+            else:
+                masked_nll = (nll * mask).sum() / (mask.sum() + torch.finfo(torch.float32).eps)
 
             # Reset hidden states where episodes ended
             # This is crucial for proper sequence handling!

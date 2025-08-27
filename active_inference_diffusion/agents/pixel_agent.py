@@ -14,7 +14,7 @@ from .base_agent import BaseActiveInferenceAgent
 from ..core.active_inference import DiffusionActiveInference, EMAModel
 from ..encoder.visual_encoders import RandomShiftAugmentation, DrQV2Encoder
 from ..encoder.state_encoders import EncoderFactory
-from ..utils.buffers import ReplayBuffer, SequenceReplayBuffer
+from ..utils.buffers import ReplayBuffer, SequenceReplayBuffer, PrioritizedSequenceReplayBuffer
 from ..configs.config import (
     ActiveInferenceConfig,
     PixelObservationConfig,
@@ -221,14 +221,30 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
             buffer_obs_shape = (self.frame_stack, *self.obs_shape)
         else:
             buffer_obs_shape = self.obs_shape
-        return SequenceReplayBuffer(
-            capacity=self.training_config.buffer_size,
-            obs_shape=buffer_obs_shape,
-            action_dim=self.action_dim,
-            device=self.device,
-            sequence_length=self.config.sequence_length if hasattr(self.config, 'sequence_length') else 10,
-            overlap=5
-        )
+        use_psr = self.training_config.prioritized_seq_replay
+        if use_psr:
+            return PrioritizedSequenceReplayBuffer(
+                capacity=self.training_config.buffer_size,
+                obs_shape=buffer_obs_shape,      # you already compute this
+                action_dim=self.action_dim,
+                device=self.device,
+                sequence_length=getattr(self.config, "sequence_length", 10),
+                overlap=getattr(self.config, "sequence_overlap", 5),
+                alpha=self.training_config.alpha, 
+                beta_start=self.training_config.beta0, 
+                beta_end=self.training_config.beta1, 
+                beta_frames=self.training_config.beta_frms, 
+                eps=self.training_config.eps,
+            )
+        else:
+            return SequenceReplayBuffer(
+                capacity=self.training_config.buffer_size,
+                obs_shape=buffer_obs_shape,
+                action_dim=self.action_dim,
+                device=self.device,
+                sequence_length=self.config.sequence_length if hasattr(self.config, 'sequence_length') else 10,
+                overlap=5
+            )
         
     def _process_observation(self, observation: np.ndarray) -> torch.Tensor:
         """Convert pixel observation to tensor with proper formatting"""
@@ -288,207 +304,259 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
         return observations
         
     def train_step(self) -> Dict[str, float]:
-        """Enhanced training step with visual representation learning"""
+        """
+        One training iteration:
+        - Uniform single-step batch for ELBO, policy (EFE), and value.
+        - PER-enabled sequence-dynamics block every N steps (sample_sequences),
+            with IS-weighted loss and priority update (TD + per-sequence dynamics NLL).
+        """
         if len(self.replay_buffer) < self.config.batch_size:
             return {}
-            
-        # Sample batch
-        batch = self.replay_buffer.sample(self.config.batch_size)
-        
-        # Process observations
-        obs = self._process_batch_observations(batch['observations'])
-        next_obs = self._process_batch_observations(batch['next_observations'])
-        actions = batch['actions'].to(self.device)
-        rewards = batch['rewards'].to(self.device)
-        dones = batch['dones'].to(self.device)
-        frame_idx = batch['frame_idx'].to(self.device)
-        prev_actions = batch['prev_actions'].to(self.device) 
-        metrics = {}
-        
-        # 1. Encode observations to feature space
-        encoded_obs = self.encode_observation(obs)
-        encoded_next_obs = self.encode_observation(next_obs)
-        batch_size = self.config.batch_size
-        # First, update reward normalizer statistics
-        
-        # 2. Generate latents via diffusion
-        if torch.isnan(encoded_obs).any() or torch.isinf(encoded_obs).any():
-            raise ValueError("Encoded observation contains NaN or Inf values")
-        with torch.no_grad():
-            belief_info = self.active_inference.update_belief_via_diffusion(encoded_obs, frame_idx=frame_idx, actions=prev_actions)
-            latents_mean = belief_info['latent_mean']
-            latents_std = belief_info['latent_std']
-            latents = belief_info['latent']
 
-            next_belief_info = self.active_inference.update_belief_via_diffusion(encoded_next_obs, frame_idx=frame_idx+1, actions=actions)
-            next_latents = next_belief_info['latent']
-        torch.nn.utils.clip_grad_norm_(self.active_inference.latent_score_network.parameters(),
-                                       max_norm=1.0 )    
-        # 3. Train diffusion components
-        self.score_optimizer.zero_grad()
-        elbo_loss, elbo_info = self.active_inference.compute_diffusion_elbo(
-            encoded_obs, 
-            rewards, 
-            raw_observations=obs, 
-            frame_index=frame_idx,
-            actions=prev_actions,
+        import math
+        metrics: Dict[str, float] = {}
+
+        # =========================
+        # 1) Uniform single-step batch
+        # =========================
+        batch = self.replay_buffer.sample(self.config.batch_size)
+
+        # Move to device / pre-process
+        obs        = self._process_batch_observations(batch['observations'])
+        next_obs   = self._process_batch_observations(batch['next_observations'])
+        actions    = batch['actions'].to(self.device)
+        rewards    = batch['rewards'].to(self.device)
+        dones      = batch['dones'].to(self.device)
+        frame_idx  = batch['frame_idx'].to(self.device)
+        prev_acts  = batch['prev_actions'].to(self.device)
+        B0         = self.config.batch_size
+
+        # Encode observations
+        encoded_obs      = self.encode_observation(obs)
+        encoded_next_obs = self.encode_observation(next_obs)
+        if torch.isnan(encoded_obs).any() or torch.isinf(encoded_obs).any():
+            raise ValueError("Encoded observation contains NaN/Inf")
+
+        # Belief update (no grad)
+        with torch.no_grad():
+            belief_now = self.active_inference.update_belief_via_diffusion(
+                encoded_obs, frame_idx=frame_idx, actions=prev_acts
+            )
+            latents      = belief_now['latent']
+            latents_mean = belief_now['latent_mean']
+            latents_std  = belief_now['latent_std']
+
+            belief_next = self.active_inference.update_belief_via_diffusion(
+                encoded_next_obs, frame_idx=frame_idx + 1, actions=actions
+            )
+            next_latents = belief_next['latent']
+
+        torch.nn.utils.clip_grad_norm_(
+            self.active_inference.latent_score_network.parameters(), max_norm=1.0
         )
 
-        # 4. Add contrastive representation loss
-        hidden_states = self.active_inference.reset_dynamics_hidden(batch_size)
-        
+        # -------------------------
+        # 1a) Diffusion ELBO (+ contrastive) — UNWEIGHTED (uniform batch)
+        # -------------------------
+        self.score_optimizer.zero_grad()
+        elbo_loss, elbo_info = self.active_inference.compute_diffusion_elbo(
+            encoded_obs, rewards, raw_observations=obs, frame_index=frame_idx, actions=prev_acts
+        )
+
+        hidden_states = self.active_inference.reset_dynamics_hidden(B0)
         hidden_states = self.active_inference._reset_done_hidden(hidden_states, dones)
 
         contrastive_loss = self.compute_representation_loss(
             encoded_obs, encoded_next_obs, actions, latents, hidden_states
         )
 
-        # Combined loss
         total_loss = elbo_loss + self.config.contrastive_weight * contrastive_loss
         total_loss.backward()
 
         torch.nn.utils.clip_grad_norm_(
             list(self.active_inference.latent_score_network.parameters()) +
             list(self.active_inference.latent_diffusion.parameters()) +
-            list(self.encoder.parameters()),
+            list(self.encoder.parameters()) +
+            list(self.active_inference.feature_decoder.parameters()) +
+            (list(self.active_inference.observation_decoder.parameters())
+            if isinstance(self.active_inference.observation_decoder, torch.nn.Module) else []),
             self.config.gradient_clip
         )
         self.score_optimizer.step()
         self.score_ema.update()
-        
-        metrics.update(elbo_info)
-        metrics['contrastive_loss'] = contrastive_loss.item()
-        metrics['total_loss'] = total_loss.item()
 
-        # 5. Train policy network
+        metrics.update({k: (float(v) if torch.is_tensor(v) else v) for k, v in elbo_info.items()})
+        metrics['contrastive_loss'] = float(contrastive_loss.detach())
+        metrics['total_loss']       = float(total_loss.detach())
+
+        # -------------------------
+        # 1b) Policy (EFE) — UNWEIGHTED (uniform batch)
+        # -------------------------
         self.policy_optimizer.zero_grad()
         self.active_inference.latent_dynamics.train()
-        
+
         efe, efe_info = self.active_inference.compute_expected_free_energy_diffusion(
-            latents,
-            horizon=self.config.efe_horizon
+            latents, horizon=self.config.efe_horizon
         )
-        
         policy_loss = efe.mean()
         policy_loss.backward()
-        
-        torch.nn.utils.clip_grad_norm_(
-            self.active_inference.policy_network.parameters(),
-            self.config.gradient_clip
-        )
+        torch.nn.utils.clip_grad_norm_(self.active_inference.policy_network.parameters(), self.config.gradient_clip)
         self.policy_optimizer.step()
-        
-        metrics['policy_loss'] = policy_loss.item()
-        metrics.update(efe_info)
-        
 
-        # 6. Train value network (Dreamer-style symlog critic)
+        metrics['policy_loss'] = float(policy_loss.detach())
+        metrics.update({f'efe_{k}': (float(v) if torch.is_tensor(v) else v) for k, v in efe_info.items()})
+
+        # -------------------------
+        # 1c) Value (critic) with EMA bootstrap — UNWEIGHTED (uniform batch)
+        # -------------------------
         self.value_optimizer.zero_grad()
+        logits = self.active_inference.value_network(latents)
 
-        # Predict current and next value logits (no time input)
-        logits = self.active_inference.value_network(latents)                    # [B, K]
-        #Use EMA target network for bootstrapping
         with torch.no_grad():
             self.value_ema.apply_shadow()
-            next_logits = self.active_inference.value_network(next_latents)      # [B, K]
+            next_logits = self.active_inference.value_network(next_latents)
             self.value_ema.restore()
-            # Use current critic expectation to compute λ-returns bootstrap terms
-            next_values = self.active_inference.value_network.expected_value(next_logits)# [B]
+            next_values = self.active_inference.value_network.expected_value(next_logits)
 
             lambda_returns = self.active_inference.compute_lambda_returns(
-                rewards=rewards,
-                next_values=next_values,
-                dones=dones,
-                lambda_=0.95,
-                n_steps=5
+                rewards=rewards, next_values=next_values, dones=dones, lambda_=0.95, n_steps=5
             )
 
-        # Main critic loss: categorical CE to two-hot symlog targets
         value_loss = self.active_inference.value_network.loss_from_returns(logits, lambda_returns).mean()
-
-        # EMA consistency: regularize current logits to match EMA logits (small weight)
-        
-
         value_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.active_inference.value_network.parameters(), self.config.gradient_clip)
         self.value_optimizer.step()
         self.value_ema.update()
 
-        metrics['value_loss'] = value_loss.item()
-        
+        metrics['value_loss'] = float(value_loss.detach())
 
-        # Train epistemic estimator separately
-        if self.total_steps % 5 == 0:  # Train less frequently for stability
+        # (optional) epistemic estimator every few steps
+        if self.total_steps % 5 == 0:
             epistemic_mi, epistemic_metrics = self.active_inference.train_epistemic_estimator(
                 latents, actions, next_latents
             )
-            metrics['epistemic_mi'] = epistemic_mi
-            metrics.update(epistemic_metrics)
+            metrics['epistemic_mi'] = float(epistemic_mi)
+            metrics.update({f'ep_{k}': (float(v) if torch.is_tensor(v) else v) for k, v in epistemic_metrics.items()})
 
-        # 7. Train dynamics model
-        # Add sequence-based dynamics training every N steps
-        if self.total_steps % 5 == 0 and hasattr(self.replay_buffer, 'sample_sequences'):
+        # ===========================================
+        # 2) PER-enabled sequence dynamics every N steps
+        # ===========================================
+        if (self.total_steps % 5 == 0) and hasattr(self.replay_buffer, 'sample_sequences'):
             seq_batch = self.replay_buffer.sample_sequences(self.config.batch_size // 2)
-        
             if seq_batch is not None:
-                # Process sequences through encoder
-                seq_obs = seq_batch['observations']  # [batch, seq_len, ...]
-                batch_size, seq_len = seq_obs.shape[:2]
-            
-                # Encode all observations in sequences
+                use_per  = ('is_weights' in seq_batch) and ('tree_indices' in seq_batch)
+                is_w     = seq_batch['is_weights']   if use_per else None   # [B]
+                tree_idx = seq_batch['tree_indices'] if use_per else None   # [B]
+
+                seq_obs  = seq_batch['observations']                       # [B, T, ...]
+                B, T     = seq_obs.shape[:2]
+
+                # ---- 2a) Build latent_sequences over the window (no grad) ----
                 latent_sequences = []
-                for t in range(seq_len):
+                for t in range(T):
                     obs_t = self._process_batch_observations(seq_obs[:, t])
-                    encoded_t = self.encode_observation(obs_t)
-                
-                    # Generate latents via diffusion
+                    enc_t = self.encode_observation(obs_t)
                     with torch.no_grad():
-                        if t== 0:
-                            prev_acts = seq_batch['prev_actions'][:, 0].to(self.device) if 'prev_actions' in seq_batch else torch.zeros(batch_size, self.action_dim, device=self.device)
+                        if t == 0:
+                            prev_t = (seq_batch['prev_actions'][:, 0].to(self.device)
+                                    if 'prev_actions' in seq_batch else
+                                    torch.zeros(B, self.action_dim, device=self.device))
                         else:
-                            prev_acts = seq_batch['prev_actions'][:, t-1].to(self.device)
-                        belief_info = self.active_inference.update_belief_via_diffusion(encoded_t, frame_idx=seq_batch['frame_idx'][:, t].to(self.device), actions=prev_acts)
-                        latent_sequences.append(belief_info['latent'])
-            
-                latent_sequences = torch.stack(latent_sequences, dim=1)
-            
-                # Train dynamics on sequences
+                            prev_t = seq_batch['prev_actions'][:, t - 1].to(self.device)
+
+                        fidx_all = seq_batch.get('frame_indices', seq_batch.get('frame_idx'))
+                        fidx_t = fidx_all[:, t].to(self.device) if fidx_all is not None else None
+
+                        belief_t = self.active_inference.update_belief_via_diffusion(
+                            enc_t, frame_idx=fidx_t, actions=prev_t
+                        )
+                    latent_sequences.append(belief_t['latent'])
+                latent_sequences = torch.stack(latent_sequences, dim=1)  # [B, T, D]
+
+                # ---- 2b) Train dynamics on sequences (IS-weighted if PER) ----
                 self.dynamics_optimizer.zero_grad()
-            
+                dyn_kwargs = {}
+                if is_w is not None:
+                    dyn_kwargs['sample_weights'] = is_w  # importance sampling correction
+
                 dynamics_metrics = self.active_inference.train_dynamics_on_sequence(
-                    latent_sequences,
-                    seq_batch['actions'],
-                    seq_batch['dones'],
-                    seq_batch['lengths'],
+                    latent_sequences,                 # [B, T, D]
+                    seq_batch['actions'],            # [B, T-1, A]
+                    seq_batch['dones'],              # [B, T-1]
+                    seq_batch['lengths'],            # [B]
+                    **dyn_kwargs
                 )
-            
-                # Get the loss tensor for backward
-                dynamics_loss = dynamics_metrics['dynamics_loss']
-                if isinstance(dynamics_loss, float):
-                    # Recompute to get tensor
-                    dynamics_loss_tensor = self.active_inference.train_dynamics_on_sequence(
+
+                dyn_loss_tensor = dynamics_metrics.get('dynamics_loss', None)
+                if not torch.is_tensor(dyn_loss_tensor):
+                    # safety: ensure we backward a tensor
+                    dyn_loss_tensor = self.active_inference.train_dynamics_on_sequence(
                         latent_sequences,
                         seq_batch['actions'],
                         seq_batch['dones'],
-                        seq_batch['lengths']
+                        seq_batch['lengths'],
+                        **dyn_kwargs
                     )['dynamics_loss']
-                else:
-                    dynamics_loss_tensor = dynamics_loss
-                
-                dynamics_loss_tensor.backward()
-            
-                torch.nn.utils.clip_grad_norm_(
-                    self.active_inference.latent_dynamics.parameters(),
-                    self.config.gradient_clip
-                )
+
+                dyn_loss_tensor.backward()
+                torch.nn.utils.clip_grad_norm_(self.active_inference.latent_dynamics.parameters(), self.config.gradient_clip)
                 self.dynamics_optimizer.step()
-            
-                metrics.update({f'seq_{k}': v for k, v in dynamics_metrics.items()})
+
+                # ---- 2c) Compute priorities & update tree (PER only) ----
+                if use_per and hasattr(self.replay_buffer, 'update_priorities'):
+                    with torch.no_grad():
+                        # TD errors per step over the window
+                        D = latent_sequences.shape[-1]
+                        v_all = self.active_inference.value_network.expected_value(
+                            self.active_inference.value_network(latent_sequences.reshape(-1, D))
+                        ).view(B, T)  # [B, T]
+
+                        r = seq_batch['rewards'][:, :T-1].to(self.device)         # [B, T-1]
+                        d = seq_batch['dones'][:, :T-1].float().to(self.device)   # [B, T-1]
+                        gamma = float(self.config.discount_factor)
+                        td = r + gamma * (1.0 - d) * v_all[:, 1:] - v_all[:, :-1] # [B, T-1]
+
+                        # Per-sequence dynamics NLL (masked mean)
+                        t_idx = torch.arange(T-1, device=self.device).unsqueeze(0).expand(B, -1)
+                        mask = (t_idx < (seq_batch['lengths'].to(self.device).unsqueeze(1) - 1)).float()  # [B, T-1]
+
+                        per_seq_sum = torch.zeros(B, device=self.device)
+                        per_seq_cnt = torch.zeros(B, device=self.device)
+                        log_2pi = math.log(2.0 * math.pi)
+                        for t in range(T - 1):
+                            cur = latent_sequences[:, t]                    # [B, D]
+                            nxt = latent_sequences[:, t + 1]                # [B, D]
+                            act = seq_batch['actions'][:, t].to(self.device) # [B, A]
+
+                            mean_t, logv_t, _ = self.active_inference.predict_next_latent(cur, act, None)
+                            step_nll = 0.5 * (
+                                log_2pi + logv_t + (nxt - mean_t).pow(2) / logv_t.exp()
+                            ).sum(dim=-1)  # [B]
+
+                            m = mask[:, t]
+                            per_seq_sum += step_nll * m
+                            per_seq_cnt += m
+
+                        eps = torch.finfo(torch.float32).eps
+                        dyn_nll_seq = per_seq_sum / (per_seq_cnt + eps)  # [B]
+
+                        # Raw priorities from TD (timewise) + per-sequence dynamics surprise
+                        priorities = self.replay_buffer.compute_sequence_priority(
+                            td_errors=td,                 # [B, T-1] (reduced inside as max/abs)
+                            elbo_losses=None,             # add when you have per-seq ELBO from the SAME seq_batch
+                            dynamics_losses=dyn_nll_seq,  # [B] (reduced inside as mean)
+                            weights=(1.0, 0.0, 0.5)
+                        )
+
+                    self.replay_buffer.update_priorities(tree_idx, priorities)
+
+                # Log sequence metrics
+                metrics.update({f'seq_{k}': (float(v) if torch.is_tensor(v) else v)
+                                for k, v in dynamics_metrics.items()})
 
         self.total_steps += 1
-        
         return metrics
-        
+
     def compute_representation_loss(
         self,
         obs: torch.Tensor,

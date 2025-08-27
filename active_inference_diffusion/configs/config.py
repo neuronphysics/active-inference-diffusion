@@ -96,6 +96,7 @@ class ActiveInferenceConfig:
     diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
     belief_dynamics: BeliefDynamicsConfig = field(default_factory=BeliefDynamicsConfig)
     frame_stack: int = 3
+
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -132,6 +133,13 @@ class TrainingConfig:
     train_frequency: int = 2
     gradient_steps: int = 4
     num_parallel_envs: int = 6  # Number of parallel environments for training
+    # prioritized replay parameters
+    sequence_length: int = 10
+    alpha: float = 0.6
+    beta0: float = 0.4
+    beta1: float = 0.4
+    beta_frms: int = 100_000
+    eps: float = 1e-6
     # Evaluation
     num_eval_episodes: int = 10
     
@@ -139,3 +147,4 @@ class TrainingConfig:
     use_wandb: bool = True
     project_name: str = "active-inference-diffusion"
     experiment_name: Optional[str] = None
+    prioritized_seq_replay:bool = True

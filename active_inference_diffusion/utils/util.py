@@ -5,6 +5,8 @@ import numpy as np
 import torch.nn.functional as F
 from typing import Optional, Union, Tuple
 import matplotlib
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes  # add at top of file or inside function
+
 matplotlib.use("Agg")
 class SpatialAttentionAggregator(nn.Module):
     """
@@ -186,101 +188,96 @@ def create_mixed_reconstruction_plot(
     frame_stacked_obs: np.ndarray,
     single_frame_recon: np.ndarray,
     save_path: str,
-    mode: str = "recent"
+    mode: str = "recent"  # use "separate" here to show 3 distinct panels
 ):
     """
     Create plot comparing frame-stacked observations with single-frame reconstructions.
-    This handles the common case where the decoder only reconstructs the current frame.
+    For C=9 inputs, we reshape to (3,3,H,W) and either stitch or show separate panels.
     """
     n_samples = frame_stacked_obs.shape[0]
-    
-    # Create figure with 3 rows: frame stack, most recent frame, reconstruction
     fig, axes = plt.subplots(3, n_samples, figsize=(n_samples * 3, 9))
-    
-    # Handle single sample case
     if n_samples == 1:
         axes = axes.reshape(3, 1)
-    
+
     for i in range(n_samples):
-        # Process frame-stacked observation
         orig = frame_stacked_obs[i]
         recon = single_frame_recon[i]
-        
-        # Extract frames from the stack
+
+        # --- extract frames ---
         if orig.ndim == 4:  # (frames, channels, H, W)
             frames = orig
-        elif orig.shape[0] > 3:  # Concatenated channels
-            # Reshape to separate frames
+        elif orig.ndim == 3 and orig.shape[0] > 3 and (orig.shape[0] % 3 == 0):
             n_frames = orig.shape[0] // 3
             h, w = orig.shape[1:]
-            frames = orig.reshape(n_frames, 3, h, w)
+            frames = orig.reshape(n_frames, 3, h, w)  # (F,3,H,W) e.g., (3,3,H,W)
         else:
-            # Already a single frame
-            frames = np.expand_dims(orig, 0) if orig.ndim == 3 else orig
-        
-        # Row 1: Show frame stack as grid
-        if frames.shape[0] > 1:
-            # Create a horizontal concatenation of frames
+            frames = np.expand_dims(orig, 0) if orig.ndim == 3 else orig  # (1,3,H,W) or (1,H,W,3)
+
+        # --- Row 1: show all frames ---
+        ax = axes[0, i]
+        ax.axis('off')
+        ax.set_title(f'Frame Stack {i}')
+        F = frames.shape[0]
+
+        if F > 1 and mode in ("separate", "separate_frames"):
+            # draw 3 separate panels (no concatenation, uses ALL frames)
+            left_margin = 0.02
+            right_margin = 0.02
+            w_frac = (1.0 - left_margin - right_margin) / F
+            for k in range(F):
+                fr = frames[k]
+                # CHW -> HWC if needed
+                fr = np.transpose(fr, (1, 2, 0)) if (fr.ndim == 3 and fr.shape[0] == 3) else fr
+                if fr.ndim == 2:
+                    fr = fr[..., None]
+                if fr.shape[-1] not in (1, 3):
+                    fr = fr[..., :3]
+                if fr.max() > 1.0:
+                    fr = fr / 255.0
+                fr = np.clip(fr, 0, 1)
+                x0 = left_margin + k * w_frac
+                iax = inset_axes(ax, width=f"{w_frac*100:.3f}%", height="100%",
+                                 bbox_to_anchor=(x0, 0.0, w_frac, 1.0),
+                                 bbox_transform=ax.transAxes, borderpad=0)
+                iax.imshow(fr if fr.shape[-1] == 3 else np.repeat(fr, 3, axis=2))
+                iax.axis('off')
+        else:
+            # current behavior: stitch frames horizontally into one image
             frame_grid = []
-            for f in range(frames.shape[0]):
-                frame = frames[f]
-                # Convert to HWC for display
-                if frame.shape[0] == 3:  # CHW format
-                    frame = np.transpose(frame, (1, 2, 0))
-                elif frame.shape[2] == 3:  # Already HWC
-                    pass
-                else:
-                    frame = frame.squeeze()  # Grayscale
-                
-                # Ensure proper range
-                if frame.max() > 1.0:
-                    frame = frame / 255.0
-                frame = np.clip(frame, 0, 1)
-                frame_grid.append(frame)
-            
-            # Concatenate frames horizontally
+            for k in range(F):
+                fr = frames[k]
+                fr = np.transpose(fr, (1, 2, 0)) if (fr.ndim == 3 and fr.shape[0] == 3) else fr
+                if fr.ndim == 2:
+                    fr = fr[..., None]
+                if fr.shape[-1] not in (1, 3):
+                    fr = fr[..., :3]
+                if fr.max() > 1.0:
+                    fr = fr / 255.0
+                frame_grid.append(np.clip(fr, 0, 1))
             grid = np.concatenate(frame_grid, axis=1)
-            axes[0, i].imshow(grid)
-            axes[0, i].set_title(f'Frame Stack {i}')
-        else:
-            # Single frame input
-            frame = process_single_frame(frames[0])
-            axes[0, i].imshow(frame)
-            axes[0, i].set_title(f'Input {i}')
-        axes[0, i].axis('off')
-        
-        # Row 2: Show most recent frame (what decoder should reconstruct)
-        most_recent = frames[-1]  # Last frame in the stack
-        most_recent_vis = process_single_frame(most_recent)
-        axes[1, i].imshow(most_recent_vis)
-        axes[1, i].set_title(f'Target Frame {i}')
-        axes[1, i].axis('off')
-        
-        # Row 3: Show reconstruction
+            ax.imshow(grid)
+
+        # --- Row 2: most recent frame (target) ---
+        most_recent_vis = process_single_frame(frames[-1])
+        axes[1, i].imshow(most_recent_vis); axes[1, i].axis('off'); axes[1, i].set_title(f'Target Frame {i}')
+
+        # --- Row 3: reconstruction ---
         recon_vis = process_single_frame(recon)
-        axes[2, i].imshow(recon_vis)
-        axes[2, i].set_title(f'Reconstruction {i}')
-        axes[2, i].axis('off')
-        
-        # Add PSNR metric between recent frame and reconstruction
+        axes[2, i].imshow(recon_vis); axes[2, i].axis('off'); axes[2, i].set_title(f'Reconstruction {i}')
+
+        # PSNR (optional)
         mse = np.mean((most_recent_vis - recon_vis) ** 2)
         psnr = 20 * np.log10(1.0 / np.sqrt(mse)) if mse > 0 else float('inf')
-        axes[2, i].text(0.5, -0.1, f'PSNR: {psnr:.1f}dB', 
-                       transform=axes[2, i].transAxes,
-                       ha='center', fontsize=8)
-    
-    # Add row labels
-    fig.text(0.02, 0.75, 'Input\nStack', rotation=90, va='center', fontsize=12, weight='bold')
-    fig.text(0.02, 0.5, 'Target\nFrame', rotation=90, va='center', fontsize=12, weight='bold')
-    fig.text(0.02, 0.25, 'Recon', rotation=90, va='center', fontsize=12, weight='bold')
-    
-    plt.tight_layout()
-    plt.subplots_adjust(left=0.05)  # Make room for row labels
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    
-    print(f"Saved frame-stack aware reconstruction visualization to {save_path}")
+        axes[2, i].text(0.5, -0.1, f'PSNR: {psnr:.1f}dB',
+                        transform=axes[2, i].transAxes, ha='center', fontsize=8)
 
+    # Row labels
+    fig.text(0.02, 0.75, 'Input\nStack', rotation=90, va='center', fontsize=12, weight='bold')
+    fig.text(0.02, 0.5,  'Target\nFrame', rotation=90, va='center', fontsize=12, weight='bold')
+    fig.text(0.02, 0.25, 'Recon', rotation=90, va='center', fontsize=12, weight='bold')
+    plt.tight_layout(); plt.subplots_adjust(left=0.05)
+    plt.savefig(save_path, dpi=150, bbox_inches='tight'); plt.close()
+    print(f"Saved frame-stack aware reconstruction visualization to {save_path}")
 
 def create_standard_reconstruction_plot(
     original_images: np.ndarray,
@@ -319,11 +316,16 @@ def create_standard_reconstruction_plot(
 
 
 def process_observation_for_display(obs: np.ndarray, mode: str) -> np.ndarray:
-    """Process any observation format for display"""
-    if obs.ndim == 4:  # Frame-stacked
+    """Process any observation format for display."""
+    # If it's a frame stack (either 4D or CHW with C>3 and divisible by 3),
+    # render an RGB frame from it (e.g., most recent or grid).
+    if obs.ndim == 4:
         return process_frame_stack(obs, mode)
-    else:  # Single frame
-        return process_single_frame(obs)
+    if obs.ndim == 3 and obs.shape[0] > 3 and (obs.shape[0] % 3 == 0):
+        # CHW where C is 3 * num_frames
+        return process_frame_stack(obs, mode)
+    # Otherwise treat as a single frame
+    return process_single_frame(obs)
 
 
 def process_single_frame(frame: np.ndarray) -> np.ndarray:
@@ -332,10 +334,19 @@ def process_single_frame(frame: np.ndarray) -> np.ndarray:
     if frame.ndim == 3 and frame.shape[0] in [1, 3]:  # (C, H, W)
         frame = np.transpose(frame, (1, 2, 0))
     elif frame.ndim == 2:  # (H, W)
-        frame = np.expand_dims(frame, axis=-1)
-    
+        frame = np.expand_dims(frame, axis=-1) #(H, W, 1)
+    # Handle CHW with C > 3 (e.g., 9): take the most recent RGB triplet
+    elif frame.ndim == 3 and frame.shape[0] > 3 and (frame.shape[0] % 3 == 0):
+        n_frames = frame.shape[0] // 3
+        c_last = 3 * (n_frames - 1)
+        last_rgb = frame[c_last:c_last + 3, ...]  # (3, H, W)
+        frame = np.transpose(last_rgb, (1, 2, 0))  # -> (H, W, 3)
+    # If it's already HWC but channels != 1/3, fall back to first 3 channels
+    elif frame.ndim == 3 and frame.shape[-1] not in (1, 3):
+        frame = frame[..., :3]
+
     # Handle grayscale
-    if frame.shape[2] == 1:
+    if frame.shape[-1] == 1:
         frame = np.repeat(frame, 3, axis=2)
     
     # Ensure proper range
