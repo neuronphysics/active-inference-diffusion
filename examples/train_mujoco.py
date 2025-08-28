@@ -333,37 +333,39 @@ def train_diffusion_active_inference(
             
             # Training phase
             if steps_collected > training_config.learning_starts:
-                training_start = time.time()
+                if hasattr(agent.replay_buffer, 'episodes') and len(agent.replay_buffer.episodes) > 0 and len(agent.replay_buffer) >= config.batch_size:
+                    print(f"Training at step {steps_collected}...")
+                    training_start = time.time()
+                    
+                    # Perform gradient updates
+                    num_updates = training_config.gradient_steps 
+                    
+                    train_metrics = {}
+                    for _ in range(num_updates):
+                        metrics = agent.train_step()
+                        for k, v in metrics.items():
+                            if k not in train_metrics:
+                                train_metrics[k] = []
+                            train_metrics[k].append(v)
+                    
+                    # Average training metrics
+                    avg_train_metrics = {}
+                    for k, v in train_metrics.items():
+                        if isinstance(v[0], torch.Tensor):
+                            # Handle torch tensors (move to CPU first)
+                            avg_train_metrics[k] = torch.stack(v).mean().cpu().item()
+                        else:
+                            # Handle regular numbers
+                            avg_train_metrics[k] = np.mean(v)
+                    
+                    training_time = time.time() - training_start
+                    avg_train_metrics['training/time'] = training_time
+                    avg_train_metrics['training/updates_per_second'] = num_updates / training_time
+                    
+                    # Log training metrics
+                    if steps_collected % training_config.log_frequency < collection_steps:
+                        logger.log(avg_train_metrics, steps_collected)
                 
-                # Perform gradient updates
-                num_updates = training_config.gradient_steps 
-                
-                train_metrics = {}
-                for _ in range(num_updates):
-                    metrics = agent.train_step()
-                    for k, v in metrics.items():
-                        if k not in train_metrics:
-                            train_metrics[k] = []
-                        train_metrics[k].append(v)
-                
-                # Average training metrics
-                avg_train_metrics = {}
-                for k, v in train_metrics.items():
-                    if isinstance(v[0], torch.Tensor):
-                        # Handle torch tensors (move to CPU first)
-                        avg_train_metrics[k] = torch.stack(v).mean().cpu().item()
-                    else:
-                        # Handle regular numbers
-                        avg_train_metrics[k] = np.mean(v)
-                
-                training_time = time.time() - training_start
-                avg_train_metrics['training/time'] = training_time
-                avg_train_metrics['training/updates_per_second'] = num_updates / training_time
-                
-                # Log training metrics
-                if steps_collected % training_config.log_frequency < collection_steps:
-                    logger.log(avg_train_metrics, steps_collected)
-            
             # Update exploration noise
             agent.update_exploration()
             

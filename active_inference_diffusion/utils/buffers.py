@@ -246,7 +246,6 @@ class SequenceReplayBuffer(ReplayBuffer):
         """Sample sequences with proper padding and masking"""
         if len(self.episodes) < batch_size:
             return None
-            
         # Sample episodes
         sampled_episodes = np.random.choice(self.episodes, batch_size, replace=True)
         
@@ -438,7 +437,7 @@ class PrioritizedSequenceReplayBuffer(SequenceReplayBuffer):
 
     def sample_sequences(self, batch_size: int) -> Optional[Dict[str, torch.Tensor]]:
         """Sample sequences via per-step PER while respecting episode boundaries."""
-        if self._tree.n_entries == 0:
+        if self._tree.n_entries == 0 or len(self.episodes) < batch_size:
             return None
 
         # Anneal beta
