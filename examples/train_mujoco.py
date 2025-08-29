@@ -2,7 +2,7 @@
 Training script for Diffusion Active Inference on MuJoCo with GPU-Optimized Parallel Data Collection
 Uses GPUCentralizedCollector for faster diffusion inference during collection
 """
-
+import os
 import torch
 import torch.multiprocessing as mp
 import gymnasium as gym
@@ -11,6 +11,7 @@ from pathlib import Path
 import argparse
 from typing import Dict, Any
 import time
+
 
 from active_inference_diffusion.agents import DiffusionStateAgent, DiffusionPixelAgent
 from active_inference_diffusion.configs.config import (

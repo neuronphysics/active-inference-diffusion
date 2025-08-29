@@ -18,7 +18,7 @@ from ..models.policy_networks import DiffusionConditionedPolicy
 from ..models.value_networks import ValueNetwork
 from ..models.dynamics_models import LatentDynamicsModel, TransformerDynamicsModel
 from .free_energy import FreeEnergyComputation
-from ..utils.util import symexp, symlog, make_symlog_bins, twohot_encode, categorical_ce_with_soft_targets
+from ..utils.util import symexp, symlog, DiscDist
 HiddenState = Union[Tuple[torch.Tensor, torch.Tensor], Dict[str, torch.Tensor], None]
 
 class DiffusionActiveInference(nn.Module):
@@ -109,8 +109,7 @@ class DiffusionActiveInference(nn.Module):
             num_layers=self.config.value_net_num_layers,
             num_bins=self.config.num_value_bins,
         )
-        self.register_buffer("value_bins_symlog", self.value_network.bins_symlog, persistent=False)
-        self.register_buffer("value_bins_real",   self.value_network.bins_real,   persistent=False)
+        
 
         # Dynamics model in latent space
         if self.config.dynamics_type == "transformer":
@@ -211,9 +210,7 @@ class DiffusionActiveInference(nn.Module):
             robust_marginals=False,     
         )
         self.num_reward_bins = getattr(self.config, "num_reward_bins", 255)
-        bins_symlog, bins_real = make_symlog_bins(self.num_reward_bins, device=self.device, dtype=torch.float32)
-        self.register_buffer("reward_bins_symlog", bins_symlog)
-        self.register_buffer("reward_bins_real",  bins_real)
+        
         # Initialize a reward predictor
         self.reward_predictor = nn.Sequential(
             nn.Linear(self.latent_dim, self.config.hidden_dim),
@@ -411,9 +408,8 @@ class DiffusionActiveInference(nn.Module):
             logits = cp.checkpoint(self.reward_predictor, latent, use_reentrant=False)
         else:
             logits = self.reward_predictor(latent)
-        probs = F.softmax(logits, dim=-1)
-        pred = (probs * self.reward_bins_real).sum(dim=-1)
-
+        dist = DiscDist(logits, low=self.config.reward_disc_low, high=self.config.reward_disc_high, device=logits.device)
+        pred = dist.mean().squeeze(-1)
         return pred, logits
 
     def update_belief_via_diffusion(
@@ -899,11 +895,8 @@ class DiffusionActiveInference(nn.Module):
         kl_weight = torch.exp(-5.0 * t.mean())  # Anneal KL over time
         # Predict rewards from latents
         pred_reward, logits_reward = self.predict_reward_from_latent(latents)
-        rewards_symlog =symexp(rewards)
-        twohot_targets = twohot_encode(rewards_symlog, self.reward_bins_symlog)
-
-        # Soft-label cross-entropy loss
-        reward_loss = categorical_ce_with_soft_targets(logits_reward, twohot_targets).mean()
+        disc = DiscDist(logits_reward, low=self.config.reward_disc_low, high=self.config.reward_disc_high, device=logits_reward.device)
+        reward_loss = (-disc.log_prob(rewards)).mean()        
         # Total ELBO
         elbo = (
             -fe_info["reconstruction_mse"]

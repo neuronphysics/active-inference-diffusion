@@ -96,7 +96,9 @@ class ActiveInferenceConfig:
     diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
     belief_dynamics: BeliefDynamicsConfig = field(default_factory=BeliefDynamicsConfig)
     frame_stack: int = 3
-
+    #
+    reward_disc_low: float = -10.0
+    reward_disc_high: float = 10.0
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 

@@ -2,7 +2,7 @@
 GPU-Optimized Parallel Data Collection Architecture
 Separates environment stepping (CPU) from diffusion inference (GPU)
 """
-
+import os
 import torch
 import torch.multiprocessing as mp
 from threading import Thread, Event
@@ -20,6 +20,7 @@ from active_inference_diffusion.envs.vec_env import ShmemVectorEnv, SubprocVecto
 """
 GPU-Optimized Parallel Data Collection using SubprocVectorEnv
 """
+
 
 
 class GPUCentralizedCollector:

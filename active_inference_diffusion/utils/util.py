@@ -400,28 +400,61 @@ def symlog(x):
 def symexp(x):
     return x.sign() * (x.abs().exp() - 1.0)
 
-def make_symlog_bins(num_bins=255, lo=-20.0, hi=20.0, device=None, dtype=None):
-    bins_symlog = torch.linspace(lo, hi, num_bins, device=device, dtype=dtype)
-    bins_real = symexp(bins_symlog)
-    return bins_symlog, bins_real
+class DiscDist:
+    def __init__(
+        self,
+        logits,
+        low=-20.0,
+        high=20.0,
+        transfwd=symlog,
+        transbwd=symexp,
+        device="cuda",
+        discrete_number=255
+    ):
+        self.logits = logits
+        self.probs = torch.softmax(logits, -1)
+        self.buckets = torch.linspace(low, high, steps=discrete_number).to(device)
+        self.width = (self.buckets[-1] - self.buckets[0]) / 255
+        self.transfwd = transfwd
+        self.transbwd = transbwd
 
-def twohot_encode(x_symlog, bins_symlog):
-    B = bins_symlog.shape[0]
-    lo, hi = bins_symlog[0], bins_symlog[-1]
-    pos = (x_symlog - lo) / (hi - lo) * (B - 1)
-    pos = pos.clamp(0, B - 1 - torch.finfo(x_symlog.dtype).eps)
-    idx0 = pos.floor().long()
-    idx1 = (idx0 + 1).clamp_max(B - 1)
-    w1 = (pos - idx0.float())
-    w0 = 1.0 - w1
-    # build soft labels
-    shape = x_symlog.shape + (B,)
-    target = torch.zeros(shape, device=bins_symlog.device, dtype=torch.float32)
-    # scatter weights into target
-    target.scatter_(-1, idx0.unsqueeze(-1), w0.unsqueeze(-1))
-    target.scatter_add_(-1, idx1.unsqueeze(-1), w1.unsqueeze(-1))
-    return target
+    def mean(self):
+        _mean = self.probs * self.buckets
+        return self.transbwd(torch.sum(_mean, dim=-1, keepdim=True))
 
-def categorical_ce_with_soft_targets(logits, soft_targets):
-    logp = torch.log_softmax(logits, dim=-1)
-    return -(soft_targets * logp).sum(dim=-1)
+    def mode(self):
+        _mode = self.probs * self.buckets
+        return self.transbwd(torch.sum(_mode, dim=-1, keepdim=True))
+
+    # Inside OneHotCategorical, log_prob is calculated using only max element in targets
+    def log_prob(self, x):
+        x = self.transfwd(x)
+        # x(time, batch, 1)
+        below = (torch.sum((self.buckets <= x[..., None]).to(torch.int32), dim=-1) - 1).to(x.device)
+        above = len(self.buckets) - torch.sum(
+            (self.buckets > x[..., None]).to(torch.int32), dim=-1
+        ).to(x.device)
+        below = torch.clip(below, 0, len(self.buckets) - 1)
+        above = torch.clip(above, 0, len(self.buckets) - 1)
+        equal = below == above
+
+        dist_to_below = torch.where(equal, torch.ones(1).to(x.device), torch.abs(self.buckets[below] - x)).to(x.device)
+        dist_to_above = torch.where(equal, torch.ones(1).to(x.device), torch.abs(self.buckets[above] - x)).to(x.device)
+        total = dist_to_below + dist_to_above
+        weight_below = dist_to_above / total
+        weight_above = dist_to_below / total
+        target = (
+            F.one_hot(below, num_classes=len(self.buckets)) * weight_below[..., None]
+            + F.one_hot(above, num_classes=len(self.buckets)) * weight_above[..., None]
+        )
+        log_pred = self.logits - torch.logsumexp(self.logits, -1, keepdim=True)
+        target = target.squeeze(-2)
+
+        return (target * log_pred).sum(-1)
+
+    def log_prob_target(self, target):
+        log_pred = self.logits - torch.logsumexp(self.logits, -1, keepdim=True)
+
+        return (target * log_pred).sum(-1)
+
+
