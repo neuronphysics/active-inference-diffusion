@@ -246,8 +246,6 @@ class LatentScoreNetwork(nn.Module):
             # Process through DiT blocks
             for block in self.transformer_blocks:
                 h = self._maybe_cp(lambda x, c: block(x, c), h, conditioning, enable=self.use_checkpoint)
-
-
         
         # Final norm and output
         h = self.norm_final(h, conditioning)

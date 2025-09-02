@@ -149,12 +149,6 @@ class LatentDiffusionProcess(nn.Module):
         self.register_buffer('posterior_log_variance_clipped',
                            torch.log(torch.clamp(posterior_variance, min=1e-20)))
         
-    def sample_latent_prior(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        """Sample from learned latent prior p_θ(z)"""
-        mean = self.latent_prior_mean.unsqueeze(0).expand(batch_size, -1)
-        std = torch.exp(self.latent_prior_log_std).unsqueeze(0).expand(batch_size, -1)
-
-        return mean, std
 
     def q_sample(
         self,

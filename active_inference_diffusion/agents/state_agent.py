@@ -127,8 +127,7 @@ class DiffusionStateAgent(BaseActiveInferenceAgent):
         with torch.no_grad():
             belief_info = self.active_inference.update_belief_via_diffusion(observations)
             latents = belief_info['latent']
-            latents_std = belief_info['latent_std']
-            latents_mean = belief_info['latent_mean']       
+       
             next_belief_info = self.active_inference.update_belief_via_diffusion(next_observations)
             next_latents = next_belief_info['latent']
         
@@ -139,7 +138,7 @@ class DiffusionStateAgent(BaseActiveInferenceAgent):
         )  # Clip gradients of score network
         self.score_optimizer.zero_grad()
         elbo_loss, elbo_info = self.active_inference.compute_diffusion_elbo(
-            observations, rewards, latents_mean, latents_std
+            observations, rewards, latents
         )
         elbo_loss.backward()
         torch.nn.utils.clip_grad_norm_(
@@ -261,8 +260,7 @@ class DiffusionStateAgent(BaseActiveInferenceAgent):
         # Dynamics optimizer
         self.dynamics_optimizer = torch.optim.AdamW(
             list(self.active_inference.latent_dynamics.parameters()) +
-            list(self.active_inference.observation_decoder.parameters())+
-            list(self.active_inference.reward_predictor.parameters()),
+            list(self.active_inference.observation_decoder.parameters()),
             lr=self.config.learning_rate
         )
         # Add epistemic optimizer

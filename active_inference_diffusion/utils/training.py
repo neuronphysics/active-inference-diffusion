@@ -160,7 +160,6 @@ def load_checkpoint(
     agent.policy_optimizer.load_state_dict(checkpoint['policy_optimizer'])
     agent.value_optimizer.load_state_dict(checkpoint['value_optimizer'])
     agent.dynamics_optimizer.load_state_dict(checkpoint['dynamics_optimizer'])
-    
     # Load training state
     agent.total_steps = checkpoint['total_steps']
     agent.episode_count = checkpoint['episode_count']

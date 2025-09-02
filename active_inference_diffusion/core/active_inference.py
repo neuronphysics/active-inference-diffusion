@@ -18,6 +18,7 @@ from ..models.policy_networks import DiffusionConditionedPolicy
 from ..models.value_networks import ValueNetwork
 from ..models.dynamics_models import LatentDynamicsModel, TransformerDynamicsModel
 from .free_energy import FreeEnergyComputation
+from .divergence import DVKL
 from ..utils.util import symexp, symlog, DiscDist
 HiddenState = Union[Tuple[torch.Tensor, torch.Tensor], Dict[str, torch.Tensor], None]
 
@@ -116,23 +117,26 @@ class DiffusionActiveInference(nn.Module):
             self.latent_dynamics = TransformerDynamicsModel(
                 state_dim=self.latent_dim,
                 action_dim=self.action_dim,
+                K=self.config.grassmann_dynamics_K,
+                r=self.config.grassmann_dynamics_r,
                 hidden_dim=self.config.hidden_dim,
                 num_layers=self.config.dynamics_num_layers,
                 n_heads=self.config.dynamics_n_heads,
                 dropout=self.config.dynamics_dropout,
                 context_len=self.config.dynamics_context_len,
-                residual=self.config.dynamics_residual,
-                use_checkpointing=self.config.dynamics_use_checkpointing,
                 attn_impl=self.config.dynamics_attn_impl,   # {"auto","flash","mem","math"} for SDPA backends
-                clear_on_reset=True,
             )
         else:
             self.latent_dynamics = LatentDynamicsModel(
                 state_dim=self.latent_dim,
                 action_dim=self.action_dim,
                 hidden_dim=self.config.hidden_dim,
-                num_layers=3,
-                lstm_hidden_dim=self.config.hidden_dim,
+                K=self.config.grassmann_dynamics_K,
+                r=self.config.grassmann_dynamics_r,
+                lstm_hidden=self.config.hidden_dim//2,
+                trunk_hidden=self.config.hidden_dim,
+                trunk_layers=self.config.dynamics_num_layers,
+                dropout=self.config.dynamics_dropout,
             )
         self.current_hidden_state = None  # Initialize hidden state for dynamics
         # Observation decoder (latent -> observation prediction)
@@ -210,7 +214,20 @@ class DiffusionActiveInference(nn.Module):
             robust_marginals=False,     
         )
         self.num_reward_bins = getattr(self.config, "num_reward_bins", 255)
+        #initialize DVKL for divergence between posterior and prior 
         
+        self.dvkl_T = nn.Sequential(
+            nn.Linear(self.latent_dim, self.config.hidden_dim), 
+            nn.LayerNorm(self.config.hidden_dim),
+            nn.Tanh(),
+            nn.Linear(self.config.hidden_dim, self.config.hidden_dim), 
+            nn.LayerNorm(self.config.hidden_dim),
+            nn.Tanh(),
+            nn.Linear(self.config.hidden_dim, 1)
+          )
+
+        self.dvkl = DVKL(self.dvkl_T, ema_momentum=self.config.dv_ema)
+
         # Initialize a reward predictor
         self.reward_predictor = nn.Sequential(
             nn.Linear(self.latent_dim, self.config.hidden_dim),
@@ -410,7 +427,7 @@ class DiffusionActiveInference(nn.Module):
             logits = self.reward_predictor(latent)
         dist = DiscDist(logits, low=self.config.reward_disc_low, high=self.config.reward_disc_high, device=logits.device)
         pred = dist.mean().squeeze(-1)
-        return pred, logits
+        return pred, logits, dist
 
     def update_belief_via_diffusion(
         self,
@@ -465,22 +482,8 @@ class DiffusionActiveInference(nn.Module):
                         action= actions
                     )
 
-                final_latents = trajectories[
-                    -1
-                ]  # Shape: (num_trajectories, latent_dim)
 
-                # Compute statistics across trajectories
-                latent_mean = final_latents.mean(
-                    dim=0, keepdim=True
-                )  # Shape: (1, latent_dim)
-                latent_std = final_latents.std(
-                    dim=0, keepdim=True
-                )  # Shape: (1, latent_dim)
-
-                # For current latent, we have options:
-
-                eps = torch.randn_like(latent_std)
-                self.current_latent = latent_mean + eps * latent_std
+                self.current_latent = trajectories[-1]  # Keep all trajectories for uncertainty estimation
 
                 # Store the full trajectory for analysis
                 self.latent_trajectory = trajectories
@@ -500,8 +503,7 @@ class DiffusionActiveInference(nn.Module):
                 # Final latent is the belief
                 self.current_latent = trajectories[-1]
                 self.latent_trajectory = trajectories
-                latent_mean = self.current_latent.mean(dim=0, keepdim=True)
-                latent_std = self.current_latent.std(dim=0, keepdim=True)
+
                 trajectory_length = len(trajectories)
         self.latent_score_network.train(training_states["score_network"])
         self.latent_diffusion.train(training_states["diffusion"])
@@ -517,8 +519,6 @@ class DiffusionActiveInference(nn.Module):
 
         return {
             "latent": self.current_latent,
-            "latent_mean": latent_mean,
-            "latent_std": latent_std,
             "trajectory_length": trajectory_length,
             "observation": observation,
             "raw_observation": raw_observation,
@@ -561,15 +561,15 @@ class DiffusionActiveInference(nn.Module):
                 action, log_prob, policy_dist = self.policy_network(current_latent)
 
                 # Predict next latent
-                next_latent_mean, next_latent_logvar, hidden_state = (
+                next_latent_dist, hidden_state = (
                     self.predict_next_latent(current_latent, action, hidden_state, done_mask=dm)
                 )
                 dm = None  # Only apply done mask at first step
-                next_latent = self.reparameterize(next_latent_mean, next_latent_logvar)
                 # 1. Pragmatic value (reward prediction)
                 # For p(o) ∝ exp(r(o)/τ), we have ln p(o) = r(o)/τ - ln Z
                 # Since Z is constant across policies, we can ignore it
-                predicted_reward, _ = self.predict_reward_from_latent(next_latent)
+                next_latent, _ = next_latent_dist.sample(B=batch_size, temperature=1.0, hard=True, device=device)
+                predicted_reward, _, _ = self.predict_reward_from_latent(next_latent)
                 # This makes high-reward states preferred under EFE p(o) ∝ exp(r(o)/τ)
                 pragmatic = predicted_reward / self.preference_temperature
 
@@ -583,8 +583,7 @@ class DiffusionActiveInference(nn.Module):
                 consistency = -self.policy_network.get_policy_entropy(current_latent)
 
                 epistemic, epistemic_metrics = self.compute_epistemic_value(
-                    next_latent_mean,
-                    next_latent_logvar,
+                    next_latent,
                     num_samples=num_ambiguity_samples,
                 )
 
@@ -620,19 +619,17 @@ class DiffusionActiveInference(nn.Module):
 
     def compute_epistemic_value(
         self,
-        next_latent_mean: torch.Tensor,
-        next_latent_logvar: torch.Tensor,
+        next_latent: torch.Tensor,
         num_samples: int = 4,
     ) -> torch.Tensor:
         # Compute epistemic value: H(o|s,π) - H(o|s,θ,π)
         # Epistemic value (ambiguity - observation uncertainty)
         # - H[p(o|s,π)] is entropy marginalizing over model parameters (using dropout)
         # - H[p(o|s,θ,π)] is entropy for a fixed set of parameters
-        next_latent_mean = next_latent_mean.to(self.device)
-        next_latent_logvar = next_latent_logvar.to(self.device)
+        next_latent = next_latent.to(self.device)
         with torch.no_grad():
             epistemic_value, metrics = self.epistemic_estimator(
-                next_latent_mean, next_latent_logvar, num_samples
+                next_latent, num_samples
             )
 
         return epistemic_value, metrics
@@ -641,20 +638,23 @@ class DiffusionActiveInference(nn.Module):
         self,
         latents: torch.Tensor,
         actions: torch.Tensor,
-        next_latents: torch.Tensor,
         hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        done_mask: Optional[torch.Tensor] = None,
     ) -> float:
         """Train MINE estimator separately"""
         latents = latents.to(self.device)
         actions = actions.to(self.device)
-        next_latents = next_latents.to(self.device)
+        done_mask = done_mask.to(self.device) if done_mask is not None else None
         # Predict next latent distribution
-        next_mean, next_logvar, hidden_state = self.predict_next_latent(
-            latents, actions, hidden_state
+        next_latent_dist=self.predict_next_latent(
+            latents,
+            actions,
+            hidden_state,
+            done_mask
         )
-
+        next_latents, _ = next_latent_dist.sample(B=latents.shape[0], hard=False, device=self.device)  # Reparameterized sample
         # Compute MINE loss (negative MI for minimization)
-        mi_estimate, metrics = self.epistemic_estimator(next_mean, next_logvar)
+        mi_estimate, metrics = self.epistemic_estimator(next_latents)
         total_loss = -mi_estimate.mean()
 
         # Optimize
@@ -667,10 +667,6 @@ class DiffusionActiveInference(nn.Module):
 
         return mi_estimate.mean().item(), metrics
 
-    def reparameterize(self, mean: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mean + eps * std
 
     def predict_next_latent(
         self,
@@ -682,31 +678,10 @@ class DiffusionActiveInference(nn.Module):
         """Predict next latent state using learned dynamics"""
         latent = latent.to(self.device)
         action = action.to(self.device)
-        next_mean, next_logvar, new_hidden_state = self.latent_dynamics(latent, action, hidden_state, done_mask)
+        prior, new_hidden_state = self.latent_dynamics(latent, action, hidden_state, done_mask)
 
-        return next_mean, next_logvar, new_hidden_state
+        return prior, new_hidden_state
 
-    def _compute_latent_kl(
-        self,
-        latent_mean: torch.Tensor,
-        latent_logvar: torch.Tensor,
-        prior_mean: torch.Tensor,
-        prior_logvar: torch.Tensor,
-    ) -> torch.Tensor:
-        """Proper KL divergence between two Gaussians"""
-        # KL(q||p) = 0.5 * (log(σ_p²/σ_q²) + (σ_q² + (μ_q - μ_p)²)/σ_p² - 1)
-        prior_var = torch.exp(prior_logvar)
-        latent_var = torch.exp(latent_logvar)
-
-        kl = 0.5 * (
-            prior_logvar
-            - latent_logvar
-            + (latent_var + (latent_mean - prior_mean) ** 2) / prior_var
-            - 1.0
-        )
-
-        # Sum over latent dimensions, mean over batch
-        return kl.sum(dim=-1).mean()
 
     def act(
         self,
@@ -749,7 +724,7 @@ class DiffusionActiveInference(nn.Module):
         action, log_prob, policy_dist = self.policy_network(
             latent, deterministic=deterministic
         )
-        _, _, self.current_hidden_state = self.predict_next_latent(
+        _, self.current_hidden_state = self.predict_next_latent(
             latent, action, self.current_hidden_state
         )
         action = action.cpu()
@@ -767,7 +742,7 @@ class DiffusionActiveInference(nn.Module):
             **belief_info,
             "expected_free_energy": efe.mean().cpu().item(),
             "action_log_prob": log_prob.mean().cpu().item(),
-            "policy_entropy": policy_dist.entropy().sum(dim=-1).mean().cpu().item(),
+            "policy_entropy": self.policy_network.get_policy_entropy(latent).mean().cpu().item(),
             **{
                 k: v.cpu().item() if torch.is_tensor(v) else v
                 for k, v in efe_info.items()
@@ -779,43 +754,47 @@ class DiffusionActiveInference(nn.Module):
     def compute_diffusion_elbo(
         self,
         observations: torch.Tensor,
-        rewards: torch.Tensor,
-        latents_mean: Optional[torch.Tensor] = None,
-        latents_std: Optional[torch.Tensor] = None,
+        next_observations: torch.Tensor,
+        actions: torch.Tensor,
+        latents: torch.Tensor,
+        next_latents: torch.Tensor,
         raw_observations: Optional[torch.Tensor] = None,
+        next_raw_observations: Optional[torch.Tensor] = None,
         frame_index: Optional[torch.Tensor] = None,
-        actions: Optional[torch.Tensor] = None,
+        previous_actions: Optional[torch.Tensor] = None,
+        done_mask: Optional[torch.Tensor] = None,
+        hidden_state: Optional[HiddenState] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Annealing time conditioned ELBO for diffusion-generated latents
-        Modified ELBO for diffusion-generated latent active inference
+        ELBO for diffusion-generated latent active inference
 
         L = E_q(z|o,π)[log p(o|z)] - D_KL[q(z|o,π)||p_θ(z)] + R_diffusion(θ)
+        accuracy − complexity (+ diffusion term)
+        - accuracy: reconstruction log-likelihood proxy (MSE)
+        - complexity: KL(q||p) approximated by −E_q[log p_G(z)] using the Grassmann prior
+        - diffusion: score matching term for the latent diffusion
+
         """
         observations = observations.to(self.device)
-        rewards = rewards.to(self.device)
+        next_observations = next_observations.to(self.device)
+        actions = actions.to(self.device)
         batch_size = observations.shape[0]
         device = self.device
 
         # Generate latents if not provided
-        if latents_mean is None or latents_std is None:
+        if latents is None:
             # Use current belief generation
             belief_info = self.update_belief_via_diffusion(
-                observations, raw_observations, frame_idx=frame_index, actions=actions
+                          observations, 
+                          raw_observations, 
+                          frame_idx=frame_index, 
+                          actions=previous_actions
             )
             latents = belief_info["latent"]
-            latents_mean = belief_info["latent_mean"]
-            latents_std = belief_info["latent_std"]
-            if latents_mean.dim() == 1:
-                latents_mean = latents_mean.unsqueeze(0)
-            if latents_std.dim() == 1:
-                latents_std = latents_std.unsqueeze(0)
+
             if (
-                torch.isnan(latents_mean).any()
-                or torch.isinf(latents_mean).any()
-                or torch.isnan(latents_std).any()
-                or torch.isinf(latents_std).any()
-                or torch.isnan(latents).any()
+                torch.isnan(latents).any()
                 or torch.isinf(latents).any()
             ):
                 raise ValueError(
@@ -823,29 +802,43 @@ class DiffusionActiveInference(nn.Module):
                 )
         else:
             # Use provided latents
-            latents_mean = latents_mean.to(device)
-            latents_std = latents_std.to(device)
-            eps = torch.randn_like(latents_std)
-            latents = latents_mean + eps * latents_std
+ 
+            latents = latents
+        if next_latents is None:
+            next_belief_info = self.update_belief_via_diffusion(
+                next_observations, next_raw_observations,
+                frame_idx=frame_index + 1 if frame_index is not None else None,
+                actions=actions
+            )
+            next_latents = next_belief_info['latent']
+        else:
+            next_latents = next_latents
+        if hidden_state is None:
+            hidden_state = self.latent_dynamics.init_hidden(batch_size, self.device)
+        
+        # Reset hidden state for done episodes
+        if done_mask is not None:
+            hidden_state = self._reset_done_hidden(hidden_state, done_mask)
+        
+        # KL term with annealing and Grassmannian prior E_q[T]-E_q[e^T]
+        with torch.no_grad():
+            prior, hidden = self.latent_dynamics(
+                state=latents.detach(),             # stop-grad into q for stability in early training
+                action=actions.detach(),
+                hidden=hidden_state,     # or a per-batch hidden you reset outside
+                done_mask=done_mask
+            )
+        kl_loss = self.dvkl(next_latents, prior)
+                     # H[p] ≈ -E_p[log p]
 
-        # Reconstruction term
-        fe_loss, fe_info = self.free_energy.compute_loss(
-            states=latents,                    # Your latent states z
-            observations=observations,         # Encoded features (for pixels) or states
-            score_network=self.latent_score_network,
-            current_time=0.0,
-            raw_observations=raw_observations,  # Pass raw pixels if available
-            frame_idx=frame_index,
-            actions=actions
+        # Reconstruction term (accuracy:-log p(o|z))
+        accuracy_loss, accuracy_info = self.free_energy.compute_accuracy(
+            states=next_latents,                    # Your latent states z
+            observations=next_observations,         # Encoded features (for pixels) or states
+            raw_observations=next_raw_observations,  # Pass raw pixels if available
         )
 
         
-
-        # Update precision based on complexity vs accuracy balance
-        self.free_energy.update_precision(
-            complexity=fe_info["complexity"],
-            accuracy=fe_info["accuracy"]
-        )
         # Diffusion score matching loss
         # Sample continuous time with importance sampling
         # Emphasize times where loss is typically high
@@ -859,10 +852,14 @@ class DiffusionActiveInference(nn.Module):
         noise = torch.randn_like(latents, device=device)
 
         noisy_latents, true_noise, sample_info = (
-            self.latent_diffusion.continuous_q_sample(latents, t, noise, frame_time=frame_index, actions=actions)
+            self.latent_diffusion.continuous_q_sample(next_latents, 
+                                                      t, 
+                                                      noise, 
+                                                      frame_time=frame_index, 
+                                                      actions=actions)
         )
-
-        predicted_score = self.latent_score_network(noisy_latents, t, observations, frame_time=frame_index, action=actions)
+        # Predict score
+        predicted_score = self.latent_score_network(noisy_latents, t, next_observations, frame_time=frame_index, action=actions)
         # Compute true score with proper scaling
 
         sigma = sample_info["sigma"]
@@ -873,48 +870,33 @@ class DiffusionActiveInference(nn.Module):
         # Annealed loss weight
         loss_weight = self.latent_diffusion.compute_loss_weight(t)
         # Score matching loss with annealing
-        score_diff = predicted_score - true_score
         # shape: (batch_size, latent_dim)
-        per_sample_losses = loss_weight.view(-1) * torch.sum(score_diff**2, dim=1)
+        per_sample_losses = loss_weight.view(-1) * torch.sum((predicted_score - true_score)**2, dim=1)
         score_matching_loss = torch.mean(per_sample_losses)
 
-        # Add gradient penalty for stability
-        grad_penalty = self._compute_gradient_penalty(noisy_latents, t, observations,
-                                                      frame_index=frame_index, 
-                                                      actions=actions)
 
-        # KL term with annealing
-        prior_latent_mean, prior_latent_std = self.latent_diffusion.sample_latent_prior(
-            batch_size, device
-        )
-        latent_logvar = torch.log(latents_std.pow(2) + torch.finfo(latents_std.dtype).eps)
-        prior_logvar = torch.log(prior_latent_std.pow(2) + torch.finfo(prior_latent_std.dtype).eps)
-        kl_loss = self._compute_latent_kl(
-            latents_mean, latent_logvar, prior_latent_mean, prior_logvar
-        )
         kl_weight = torch.exp(-5.0 * t.mean())  # Anneal KL over time
-        # Predict rewards from latents
-        pred_reward, logits_reward = self.predict_reward_from_latent(latents)
-        disc = DiscDist(logits_reward, low=self.config.reward_disc_low, high=self.config.reward_disc_high, device=logits_reward.device)
-        reward_loss = (-disc.log_prob(rewards)).mean()        
-        # Total ELBO
+        
+        # Total ELBO (to maximize)= accuracy - complexity + entropy - diffusion
         elbo = (
-            -fe_info["reconstruction_mse"]
-            + self.config.kl_weight * kl_loss * kl_weight
-            + self.config.diffusion_weight * score_matching_loss
-            + 0.1 * grad_penalty
-            - self.config.reward_weight * reward_loss
+            -accuracy_info["reconstruction_mse"] #minimize positive reconstruction error (Maximize accuracy)
+            - self.config.kl_weight * kl_loss * kl_weight #minimize positive complexity
+            - self.config.diffusion_weight * score_matching_loss
         )
         self._update_time_importance(t, per_sample_losses.detach())
+        # Update precision based on balance
+        self.free_energy.update_precision(
+            complexity=kl_loss.detach(),
+            accuracy=accuracy_info["accuracy"]
+        )
         info = {
-            "reconstruction_loss": fe_info["reconstruction_mse"].item(),
+            "reconstruction_loss": accuracy_info["reconstruction_mse"].item(),
             "kl_loss": kl_loss.item(),
             "score_matching_loss": score_matching_loss.item(),
             "elbo": elbo.item(),
-            "reward_loss": reward_loss.item(),
-            "grad_penalty": grad_penalty.item(),
             "mean_time": t.mean().item(),
             "loss_weight_mean": loss_weight.mean().item(),
+            "hidden_state":hidden
         }
 
         return -elbo, info  # Return negative ELBO as loss
@@ -938,8 +920,7 @@ class DiffusionActiveInference(nn.Module):
        
 
         total_loss = 0
-        total_nll = 0
-        total_steps = 0
+
 
         for t in range(max_seq_len - 1):
             # Create mask for valid time steps
@@ -947,49 +928,45 @@ class DiffusionActiveInference(nn.Module):
             if mask.sum() == 0:
                 break
 
-            current_latent = latent_sequences[:, t]
-            next_latent_true = latent_sequences[:, t + 1]
-            action = action_sequences[:, t]
-            done = done_sequences[:, t]
+            z_t = latent_sequences[:, t]
+            z_tp1 = latent_sequences[:, t + 1]
+            a_t = action_sequences[:, t]
+            d_t = done_sequences[:, t]
 
             # Predict next latent with hidden state
-            next_mean, next_logvar, new_hidden_states = self.predict_next_latent(
-                current_latent, action, hidden_states, done_mask=done
+            prior, new_hidden_states = self.predict_next_latent(
+                z_t, a_t, hidden_states, done_mask=d_t
             )
-                
-            # Compute NLL loss
-            nll = 0.5 * (
-                np.log(2 * np.pi)
-                + next_logvar
-                + (next_latent_true - next_mean).pow(2) / next_logvar.exp()
-            ).sum(dim=-1)
+            z_hat, _ = prior.sample(B=z_t.size(0), temperature=1.0, hard=False, device=device)  # [B, D]
 
-            # Apply sequence mask
+            # InfoNCE: positives on the diagonal, negatives are other items in the batch
+            # Cosine similarity (normalized) with temperature τ
+            z_hat_n = F.normalize(z_hat, dim=-1)
+            z_tp1_n = F.normalize(z_tp1, dim=-1)
+            logits  = (z_hat_n @ z_tp1_n.t()) / self.config.contrastive_tau  # [B, B]
+            labels  = torch.arange(z_t.size(0), device=device)                # positives are diagonal
+
+            # mask invalid steps (set their logits to -inf so they don't contribute)
+            if mask.sum() < mask.numel():
+                valid = mask.bool()
+                logits = logits[valid][:, valid]
+                labels = torch.arange(valid.sum(), device=device)
+
+            step_loss = F.cross_entropy(logits, labels)
+
             if sample_weights is not None:
-                sw = sample_weights  # [B]
-                masked_nll = ( (nll * mask) * sw ).sum() / ((mask * sw).sum() + torch.finfo(torch.float32).eps)
+                w = (sample_weights * mask).sum() / (mask.sum() + torch.finfo(torch.float32).eps)
+                total_loss = total_loss + w * step_loss
             else:
-                masked_nll = (nll * mask).sum() / (mask.sum() + torch.finfo(torch.float32).eps)
+                total_loss = total_loss + step_loss
 
-            # Reset hidden states where episodes ended
-            # This is crucial for proper sequence handling!
-            if done.any():
-                # Create new hidden states for completed episodes 
-                new_hidden_states = self._blend_hidden(new=new_hidden_states, done=done)
+            # reset/blend hidden where episodes ended at t
+            hidden_states = self._blend_hidden(new=new_hidden_states, done=d_t)
 
-
-            hidden_states = new_hidden_states
-
-            total_loss += masked_nll
-            total_nll += masked_nll.detach()
-            total_steps += 1
-
-        avg_loss = total_loss / max(total_steps, 1)
-
+        avg_loss = total_loss / max(1, (sequence_lengths - 1).clamp_min(0).sum().item())
         return {
-            "dynamics_loss": avg_loss.item(),
-            "dynamics_nll": (total_nll / max(total_steps, 1)).item(),
-            "valid_steps": total_steps,
+            "dynamics_loss": avg_loss,
+            "valid_steps": int((sequence_lengths - 1).clamp_min(0).sum().item()),
         }
 
     def compute_lambda_returns(
@@ -1053,27 +1030,6 @@ class DiffusionActiveInference(nn.Module):
 
         return out
 
-    def _compute_gradient_penalty(
-        self, noisy_latents: torch.Tensor, t: torch.Tensor, observations: torch.Tensor,
-        frame_index: Optional[torch.Tensor] = None,
-        actions: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """Gradient penalty for stable training"""
-        noisy_latents = noisy_latents.detach().requires_grad_(True)
-        score = self.latent_score_network(noisy_latents, t, observations,
-                                           frame_time=frame_index, action=actions)
-
-        gradients = torch.autograd.grad(
-            outputs=score.sum(),
-            inputs=noisy_latents,
-            create_graph=True,
-            retain_graph=True,
-        )[0]
-
-        grad_norm = gradients.norm(2, dim=1)
-        penalty = torch.mean((grad_norm - 1.0) ** 2)
-
-        return penalty
 
     def _importance_sample_time(
         self, batch_size: int, device: torch.device
@@ -1377,22 +1333,26 @@ class FunctionSpaceEpistemicEstimator(nn.Module):
     # ---------- Forward: MINE-DV lower bound ----------
     def forward(
         self,
-        next_latent_mean: torch.Tensor,   # [B, Dz]
-        next_latent_logvar: torch.Tensor, # [B, Dz]
+        z_samples: torch.Tensor,   # [B, Dz]
         num_samples: int = 5,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         I ≈ E_joint[T] - log E_marg[exp(T)]
         Returns per-batch scalar replicated to [B].
         """
-        B, Dz = next_latent_mean.shape
-        device = self.device
 
         # Sample z ~ N(mean, diag(exp(logvar)))
-        eps = torch.randn(num_samples, B, Dz, device=device)
-        std = torch.exp(0.5 * next_latent_logvar.unsqueeze(0))
-        z_samples = next_latent_mean.unsqueeze(0) + eps * std
-        z_samples = z_samples.reshape(num_samples * B, Dz).contiguous()  # [S*B, Dz]
+        B, Dz = z_samples.shape
+        if num_samples > 1:
+            # Tile the latents S times along a new axis, then flatten
+            z_samples = (
+                z_samples.unsqueeze(1)               # [B, 1, Dz]
+                        .expand(B, num_samples, Dz) # [B, S, Dz]  (no copy)
+                        .reshape(num_samples * B, Dz)  # [S*B, Dz]
+                        .contiguous()
+    )
+        
+        z_samples = z_samples + torch.randn_like(z_samples)  # [S*B, Dz]
 
         # JVP features → projector (checkpoint if enabled & grad flows)
         jac_feats = self._compute_chunked_jvp(z_samples)                        # [S*B, N*F]
@@ -1434,7 +1394,7 @@ class FunctionSpaceEpistemicEstimator(nn.Module):
         self.running_mean = self.ema_decay * self.running_mean + (1 - self.ema_decay) * mi_lower_bound.detach()
 
         epistemic_value = mi_lower_bound.expand(B)
-        del eps, std, z_samples, jac_feats, jac_proj, lat_proj, joint_in, t_joint, t_marg
+        del  z_samples, jac_feats, jac_proj, lat_proj, joint_in, t_joint, t_marg
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         metrics = {

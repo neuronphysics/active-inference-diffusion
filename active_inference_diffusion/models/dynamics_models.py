@@ -1,176 +1,317 @@
 """
 Dynamics model implementations
 """
+
+import math
+from typing import Optional, Tuple, Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, Dict
-from torch.nn.attention import sdpa_kernel
+from torch.distributions import RelaxedOneHotCategorical
+
+# ---------- Conditional Grassmann-Mixture prior (batch-wise) ----------
+
+class ConditionalGrassmannMixture:
+    """
+    Batch-conditional mixture on a Grassmann manifold (per-sample parameters).
+
+    For each item b in the batch, we have a K-component mixture with:
+      - logits[b, K]
+      - U_raw[b, K, D, r]   (orthonormalized via QR -> Stiefel bases)
+      - m[b, K, r]          (means in subspace coordinates)
+      - log_sigma_par[b, K], log_sigma_perp[b, K]
+
+    API mirrors your existing prior:
+      - sample(B, temperature, hard, device) -> (z: [B, D], y: [B, K])
+      - log_prob(z) (optional, for debugging)
+    """
+
+    def __init__(
+        self,
+        logits: torch.Tensor,           # (B, K)
+        U_raw: torch.Tensor,            # (B, K, D, r)
+        m: torch.Tensor,                # (B, K, r)
+        log_sigma_par: torch.Tensor,    # (B, K)
+        log_sigma_perp: torch.Tensor,   # (B, K)
+    ):
+        assert logits.dim() == 2
+        assert U_raw.dim() == 4
+        B, K = logits.shape
+        assert U_raw.shape[:2] == (B, K)
+        self.logits = logits
+        self.U_raw = U_raw
+        self.m = m
+        self.log_sigma_par = log_sigma_par
+        self.log_sigma_perp = log_sigma_perp
+        self.B = B
+        self.K = K
+        self.D = U_raw.shape[2]
+        self.r = U_raw.shape[3]
+        self.device = logits.device
+        self.dtype = logits.dtype
+
+    def _orthonormalize(self) -> torch.Tensor:
+        """
+        QR per (B,K) -> U with orthonormal columns.
+        torch.linalg.qr supports batching over leading dims.
+        Returns: U of shape (B, K, D, r)
+        """
+        # Flatten (B,K) for a single batched QR, then unflatten.
+        BK, D, r = self.B * self.K, self.D, self.r
+        U_in = self.U_raw.reshape(BK, D, r)
+        Q, R = torch.linalg.qr(U_in)  # (BK, D, r)
+        # Fix sign ambiguity for stability (match your prior).
+        diag = torch.diagonal(R, dim1=-2, dim2=-1)
+        s = torch.sign(diag)
+        s = torch.where(s == 0, torch.ones_like(s), s)
+        Q = Q * s.unsqueeze(-2)
+        return Q.reshape(self.B, self.K, D, r)
+
+    @torch.no_grad()
+    def _project_perp(self, U: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """
+        Project x onto the orthogonal complement of span(U).
+        U: (B,K,D,r), x: (B,K,D) -> x_perp: (B,K,D)
+        """
+        # e_par = U^T x  -> (B,K,r)
+        e_par = torch.einsum('bkdr,bkd->bkr', U, x)
+        # P e = U e_par   -> (B,K,D)
+        Pe = torch.einsum('bkdr,bkr->bkd', U, e_par)
+        return x - Pe
+
+    def sample(
+        self,
+        B: Optional[int] = None,
+        temperature: float = 0.7,
+        hard: bool = False,
+        device: Optional[torch.device] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Differentiable mixture draw z ~ sum_k y_k N_k(·) with:
+          1) y ~ Concrete(pi, tau)
+          2) For each k, draw z_k = U_k (m_k + σ∥ ε∥) + σ⊥ (I - U_kU_k^T) ε⊥
+          3) z = Σ_k y_k z_k
+        Returns:
+          z: (B, D), y: (B, K)
+        Matches your global prior's API so DV-KL can call it directly.  :contentReference[oaicite:3]{index=3}
+        """
+        if B is not None:
+            # Sanity: we return exactly one sample per conditional prior in the batch.
+            if B != self.B:
+                raise ValueError(f"Conditional prior is batch-sized ({self.B}); got B={B}.")
+        B = self.B
+        device = device or self.device
+
+        K, D, r = self.K, self.D, self.r
+        U = self._orthonormalize()  # (B,K,D,r)
+
+        # 1) Gumbel-Softmax over mixture logits (pathwise)
+        dist = RelaxedOneHotCategorical(
+            temperature=torch.as_tensor(temperature, device=device, dtype=self.dtype),
+            logits=self.logits,
+        )
+        y = dist.rsample()  # (B,K)
+        if hard:
+            idx = y.argmax(dim=-1)
+            y_h = F.one_hot(idx, num_classes=K).to(y.dtype)
+            y = (y_h - y).detach() + y  # straight-through
+
+        # 2) Per-component samples
+        eps_par = torch.randn(B, K, r, device=device, dtype=self.dtype)           # ε∥
+        eps_perp = torch.randn(B, K, D, device=device, dtype=self.dtype)          # ε⊥
+
+        sig_par = torch.exp(self.log_sigma_par)[:, :, None]    # (B,K,1)
+        sig_perp = torch.exp(self.log_sigma_perp)[:, :, None]  # (B,K,1)
+
+        z_par = self.m + sig_par * eps_par                     # (B,K,r)
+        z_par_amb = torch.einsum('bkdr,bkr->bkd', U, z_par)    # U z∥  -> (B,K,D)
+
+        e_perp = self._project_perp(U, eps_perp)               # (I - UU^T) ε⊥
+        z_perp = sig_perp * e_perp                              # (B,K,D)
+
+        z_k = z_par_amb + z_perp                                # (B,K,D)
+
+        # 3) Blend by y
+        z = (y.unsqueeze(-1) * z_k).sum(dim=1)                  # (B,D)
+        return z, y
+
+    def log_prob(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        Optional: log p(z) = logsumexp_k [ log pi_k + log N_k(z) ].
+        Useful for monitoring but not required by DV-KL.  :contentReference[oaicite:4]{index=4}
+        """
+        B, D = z.shape
+        assert B == self.B and D == self.D
+        U = self._orthonormalize()                              # (B,K,D,r)
+
+        # Projections
+        z_par = torch.einsum('bd,bkdr->bkr', z, U)              # (B,K,r)
+        z2 = (z * z).sum(dim=-1, keepdim=True)                  # (B,1)
+        zpar2 = (z_par * z_par).sum(dim=-1)                     # (B,K)
+        zperp2 = (z2 - zpar2).clamp_min(0.)                     # (B,K)
+
+        logsp = self.log_sigma_par                              # (B,K)
+        logso = self.log_sigma_perp                             # (B,K)
+        invp = torch.exp(-2.0 * logsp)
+        invo = torch.exp(-2.0 * logso)
+
+        spar = ((z_par - self.m) ** 2).sum(dim=-1)              # (B,K)
+
+        rdim = U.shape[-1]
+        log_2pi = torch.log(torch.tensor(2.0 * torch.pi, device=z.device, dtype=z.dtype))
+        log_norm = -0.5 * (rdim * (log_2pi + 2 * logsp) + (D - rdim) * (log_2pi + 2 * logso))  # (B,K)
+        logNk = log_norm - 0.5 * (spar * invp + zperp2 * invo)                                   # (B,K)
+        log_pi = F.log_softmax(self.logits, dim=-1)                                               # (B,K)
+        return torch.logsumexp(log_pi + logNk, dim=-1)                                            # (B,)
+
+# ---------- Shared small MLP block ----------
+
+def mlp(in_dim, hidden, out_dim, num_layers=2, act=nn.ELU, dropout=0.0):
+    layers = []
+    for i in range(num_layers):
+        layers += [nn.Linear(in_dim if i == 0 else hidden, hidden), nn.LayerNorm(hidden), act(), nn.Dropout(dropout)]
+    layers += [nn.Linear(hidden, out_dim)]
+    return nn.Sequential(*layers)
+
+# ---------- LSTM Grassmann dynamics ----------
+
 class LatentDynamicsModel(nn.Module):
     """
-    Latent dynamics model f([state_t, action_t]) -> state_{t+1}
-    LSTM variant with optional per-item reset via `done_mask` (like the Transformer).
+    f([z_t, a_t], h_t) -> ConditionalGrassmannMixture over z_{t+1}
+
+    Returns:
+      prior: ConditionalGrassmannMixture
+      new_hidden: (h, c)
     """
 
     def __init__(
         self,
         state_dim: int,
         action_dim: int,
-        hidden_dim: int = 256,
-        num_layers: int = 3,
-        residual: bool = True,
-        lstm_hidden_dim: int = 128,
+        K: int,
+        r: int,
+        lstm_hidden: int = 128,
+        trunk_hidden: int = 256,
+        trunk_layers: int = 2,
         dropout: float = 0.1,
+        log_sigma_bounds: Tuple[float, float] = (-3.0, 1.5),  # ~[0.05, 4.5]
     ):
         super().__init__()
+        self.D = state_dim
+        self.A = action_dim
+        self.K = K
+        self.r = r
+        self.logsig_min, self.logsig_max = log_sigma_bounds
 
-        self.residual = residual
-        self.lstm_hidden_dim = lstm_hidden_dim
-
-        # Belief LSTM over [s_t, a_t]; we do single-step updates (seq_len=1) with batch_first=True
         self.belief_lstm = nn.LSTM(
             input_size=state_dim + action_dim,
-            hidden_size=lstm_hidden_dim,
+            hidden_size=lstm_hidden,
             num_layers=2,
             batch_first=True,
             dropout=dropout,
         )
 
-        # (Optional) buffers if you later want learned h0/c0; currently unused (zeros)
-        self.register_buffer("lstm_h0", None)
-        self.register_buffer("lstm_c0", None)
+        feat_dim = state_dim + action_dim + lstm_hidden
+        self.trunk = mlp(feat_dim, trunk_hidden, trunk_hidden, num_layers=trunk_layers, dropout=dropout)
 
-        # MLP that reads [s_t, a_t, h_t] and outputs (mean, logvar) for s_{t+1}
-        input_dim = state_dim + action_dim + lstm_hidden_dim
-        layers = []
-        for i in range(num_layers):
-            layers.append(nn.Linear(input_dim if i == 0 else hidden_dim, hidden_dim))
-            layers.append(nn.LayerNorm(hidden_dim))
-            layers.append(nn.ELU())
-            layers.append(nn.Dropout(dropout))
-        layers.append(nn.Linear(hidden_dim, 2 * state_dim))
-        self.network = nn.Sequential(*layers)
+        # Separate heads for mixture parameters
+        self.head_logits = nn.Linear(trunk_hidden, K)
+        self.head_U = nn.Linear(trunk_hidden, K * state_dim * r)
+        self.head_m = nn.Linear(trunk_hidden, K * r)
+        self.head_logs = nn.Linear(trunk_hidden, 2 * K)
 
-        # Output init: tiny if residual, otherwise Xavier
-        if residual:
-            nn.init.uniform_(self.network[-1].weight, -1e-3, 1e-3)
-            nn.init.zeros_(self.network[-1].bias)
-        else:
-            nn.init.xavier_uniform_(self.network[-1].weight, gain=1.0)
-            nn.init.zeros_(self.network[-1].bias)
+        # Small init to keep things stable
+        for head in [self.head_logits, self.head_U, self.head_m, self.head_logs]:
+            nn.init.uniform_(head.weight, -1e-3, 1e-3)
+            nn.init.zeros_(head.bias)
 
-        self._init_lstm_weights()
-
-    def _init_lstm_weights(self):
-        """Initialize LSTM weights for stable training."""
-        for name, param in self.belief_lstm.named_parameters():
+        # LSTM init
+        for name, p in self.belief_lstm.named_parameters():
             if "weight_ih" in name:
-                nn.init.xavier_uniform_(param.data)
+                nn.init.xavier_uniform_(p)
             elif "weight_hh" in name:
-                nn.init.orthogonal_(param.data)
+                nn.init.orthogonal_(p)
             elif "bias" in name:
-                nn.init.zeros_(param.data)
-                # Forget gate bias = 1 (gates order: i, f, g, o)
-                n = param.size(0)
-                param.data[n // 4 : n // 2].fill_(1.0)
+                nn.init.zeros_(p)
+                n = p.size(0)
+                p.data[n // 4 : n // 2].fill_(1.0)  # forget gate bias
 
-    def init_hidden(self, batch_size: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Fresh hidden for new sequences. Shape: (num_layers, B, lstm_hidden_dim)."""
-        num_layers = self.belief_lstm.num_layers
-        h0 = torch.zeros(num_layers, batch_size, self.lstm_hidden_dim, device=device)
-        c0 = torch.zeros(num_layers, batch_size, self.lstm_hidden_dim, device=device)
+    def init_hidden(self, B: int, device: torch.device):
+        h0 = torch.zeros(2, B, self.belief_lstm.hidden_size, device=device)
+        c0 = torch.zeros(2, B, self.belief_lstm.hidden_size, device=device)
         return (h0, c0)
-
-    def _maybe_reinit_hidden(
-        self,
-        hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]],
-        batch_size: int,
-        device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if hidden_state is None:
-            return self.init_hidden(batch_size, device)
-        h, c = hidden_state
-        # If batch size changed (e.g., at episode start), reinit
-        if h.size(1) != batch_size or c.size(1) != batch_size:
-            return self.init_hidden(batch_size, device)
-        return h, c
 
     def forward(
         self,
-        state: torch.Tensor,                              # (B, state_dim)
-        action: torch.Tensor,                             # (B, action_dim)
-        hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        done_mask: Optional[torch.Tensor] = None          # (B,) bool or {0,1}; True resets BEFORE current step
-    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """
-        Returns:
-            next_state_mean: (B, state_dim)
-            next_state_logvar: (B, state_dim)
-            new_hidden_state: (h, c) where each is (num_layers, B, lstm_hidden_dim)
-        """
+        state: torch.Tensor,                 # (B, D)
+        action: torch.Tensor,                # (B, A)
+        hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        done_mask: Optional[torch.Tensor] = None,   # (B,), True resets BEFORE current step
+    ) -> Tuple[ConditionalGrassmannMixture, Tuple[torch.Tensor, torch.Tensor]]:
         B = state.size(0)
         device = state.device
 
-        # Prepare input and hidden
-        inputs = torch.cat([state, action], dim=-1)              # (B, S+A)
-        if hidden_state is None:
-            hidden_state = self.init_hidden(B, device)
+        x = torch.cat([state, action], dim=-1)           # (B, D+A)
+        if hidden is None:
+            hidden = self.init_hidden(B, device)
 
-        if done_mask is not None:
-            dm = done_mask.float().view(1, B, 1)  # [1, B, 1] for broadcasting
-            h, c = hidden_state
-            # h,c: [num_layers, B, H] - broadcast correctly
-            h = h * (1.0 - dm)  # No transpose needed
+        if done_mask is not None and done_mask.any():
+            dm = done_mask.float().view(1, B, 1)
+            h, c = hidden
+            h = h * (1.0 - dm)
             c = c * (1.0 - dm)
-            hidden_state = (h, c)
+            hidden = (h, c)
 
-        lstm_out, new_hidden = self.belief_lstm(inputs.unsqueeze(1), hidden_state)
+        _, new_hidden = self.belief_lstm(x.unsqueeze(1), hidden)   # single-step
+        h_last = new_hidden[0][-1]                                 # (B, lstm_hidden)
 
-        combined_feature = torch.cat([inputs, new_hidden[0][-1]], dim=-1)
-        output = self.network(combined_feature)
-        mean_state, log_var_state = torch.chunk(output, 2, dim=-1)
+        feat = self.trunk(torch.cat([x, h_last], dim=-1))          # (B, H)
 
-        next_state_mean = state + mean_state if self.residual else mean_state
-        next_state_logvar = torch.clamp(log_var_state, min=-10, max=2)
-        return next_state_mean, next_state_logvar, new_hidden
+        logits = self.head_logits(feat)                            # (B, K)
+        U_raw = self.head_U(feat).view(B, self.K, self.D, self.r)  # (B, K, D, r)
+        m = self.head_m(feat).view(B, self.K, self.r)              # (B, K, r)
+        logs = self.head_logs(feat).view(B, self.K, 2)             # (B, K, 2)
+        log_sigma_par = logs[..., 0].clamp_(self.logsig_min, self.logsig_max)   # (B, K)
+        log_sigma_perp = logs[..., 1].clamp_(self.logsig_min, self.logsig_max)  # (B, K)
+
+        prior = ConditionalGrassmannMixture(logits, U_raw, m, log_sigma_par, log_sigma_perp)
+        return prior, new_hidden
+
+# ---------- Transformer Grassmann dynamics ----------
 
 class TransformerDynamicsModel(nn.Module):
     """
-    Causal Transformer dynamics: f([state, action]_t, context) -> state_{t+1}
-    
-      - init_hidden(batch, device) -> hidden
-      - forward(state, action, hidden, done_mask=None) -> (mean, logvar, hidden)
+    Causal Transformer dynamics -> ConditionalGrassmannMixture over z_{t+1}.
+
+    Keeps a context of the last `context_len` tokens of [z_t, a_t].
     """
 
     def __init__(
         self,
         state_dim: int,
         action_dim: int,
+        K: int,
+        r: int,
         hidden_dim: int = 256,     # d_model
         num_layers: int = 2,
         n_heads: int = 4,
         dropout: float = 0.1,
         context_len: int = 16,
-        residual: bool = True,
-        use_checkpointing: bool = False,
-        attn_impl: str = "auto",   # {"auto","flash","mem","math"} for SDPA backends
+        attn_impl: str = "auto",
+        log_sigma_bounds: Tuple[float, float] = (-3.0, 1.5),
         clear_on_reset: bool = True,
-        logvar_min: float = -10.0,
-        logvar_max: float = 2.0,
     ):
         super().__init__()
-        self.state_dim = state_dim
-        self.action_dim = action_dim
+        self.D = state_dim
+        self.A = action_dim
+        self.K = K
+        self.r = r
         self.d_model = hidden_dim
         self.context_len = context_len
-        self.residual = residual
-        self.use_checkpointing = use_checkpointing
         self.attn_impl = attn_impl
         self.clear_on_reset = clear_on_reset
-        self.logvar_min = logvar_min
-        self.logvar_max = logvar_max
+        self.logsig_min, self.logsig_max = log_sigma_bounds
 
-        # Token for [state, action]
         self.token_proj = nn.Sequential(
             nn.Linear(state_dim + action_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -178,11 +319,9 @@ class TransformerDynamicsModel(nn.Module):
             nn.Dropout(dropout),
         )
 
-        # Learned absolute positions [T, d_model]
         self.pos_embed = nn.Parameter(torch.zeros(context_len, hidden_dim))
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
 
-        # Pre-norm Transformer encoder (batch_first=True)
         enc_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=n_heads,
@@ -194,22 +333,26 @@ class TransformerDynamicsModel(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
 
-        # Head: (mean, logvar) of next state
-        self.head = nn.Sequential(
+        # Trunk + heads for mixture parameters
+        self.trunk = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 2 * state_dim),
         )
-        nn.init.uniform_(self.head[-1].weight, -1e-3, 1e-3)
-        nn.init.zeros_(self.head[-1].bias)
+        self.head_logits = nn.Linear(hidden_dim, K)
+        self.head_U = nn.Linear(hidden_dim, K * state_dim * r)
+        self.head_m = nn.Linear(hidden_dim, K * r)
+        self.head_logs = nn.Linear(hidden_dim, 2 * K)
 
+        for head in [self.head_logits, self.head_U, self.head_m, self.head_logs]:
+            nn.init.uniform_(head.weight, -1e-3, 1e-3)
+            nn.init.zeros_(head.bias)
 
-    def init_hidden(self, batch_size: int, device: torch.device) -> Dict[str, torch.Tensor]:
-        # Fixed-capacity ring buffer to avoid reallocation each step
-        tokens = torch.empty(batch_size, self.context_len, self.d_model, device=device)
-        lengths = torch.zeros(batch_size, dtype=torch.long, device=device)  # valid length in [0..context_len]
+    def init_hidden(self, B: int, device: torch.device) -> Dict[str, torch.Tensor]:
+        tokens = torch.empty(B, self.context_len, self.d_model, device=device)
+        lengths = torch.zeros(B, dtype=torch.long, device=device)
+        tokens.zero_();  # start clean
         return {"tokens": tokens, "lengths": lengths}
 
     def _maybe_reset_hidden(self, hidden: Optional[Dict[str, torch.Tensor]], B: int, device):
@@ -227,140 +370,66 @@ class TransformerDynamicsModel(nn.Module):
 
     @staticmethod
     def _causal_mask(T: int, device: torch.device):
-        # (T,T) with -inf above diagonal
         return torch.ones(T, T, dtype=torch.bool, device=device).triu(1)
 
     @staticmethod
     def _key_padding_mask(lengths: torch.Tensor, T: int):
-        """
-        lengths: (B,) valid lengths, 0..T
-        return: (B, T) True where PAD, False where valid
-        """
         B = lengths.size(0)
-        ar = torch.arange(T, device=lengths.device).unsqueeze(0).expand(B, T)  # (B,T)
+        ar = torch.arange(T, device=lengths.device).unsqueeze(0).expand(B, T)
         return ar >= lengths.clamp_max(T).unsqueeze(1)
-
-    def _sdpa_backend_ctx(self):
-        """
-        Select SDPA backend if on CUDA + PyTorch>=2.
-        - flash: fastest (constraints on head dim etc.)
-        - mem: memory-efficient
-        - math: matmul
-        - auto: let PyTorch decide
-        """
-        try:
-            
-            if self.attn_impl == "flash":
-                return sdpa_kernel(enable_flash=True, enable_mem_efficient=False, enable_math=False)
-            elif self.attn_impl == "mem":
-                return sdpa_kernel(enable_flash=False, enable_mem_efficient=True, enable_math=False)
-            elif self.attn_impl == "math":
-                return sdpa_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True)
-            else:  # "auto"
-                class _NullCtx:
-                    def __enter__(self): return None
-                    def __exit__(self, exc_type, exc, tb): return False
-                return _NullCtx()
-        except Exception:
-            class _NullCtx:
-                def __enter__(self): return None
-                def __exit__(self, exc_type, exc, tb): return False
-            return _NullCtx()
-
-    def get_memory_usage(self, batch_size: int) -> Dict[str, float]:
-        """Rough memory usage report (MB) for the token buffer + parameters (fp32)."""
-        token_mb = batch_size * self.context_len * self.d_model * 4 / 1024**2
-        param_mb = sum(p.numel() * 4 for p in self.parameters()) / 1024**2
-        return {"token_buffer_mb": token_mb, "parameters_mb": param_mb, "total_mb": token_mb + param_mb}
-
 
     def forward(
         self,
-        state: torch.Tensor,                     # (B, S)
+        state: torch.Tensor,                     # (B, D)
         action: torch.Tensor,                    # (B, A)
-        hidden_state: Optional[Dict[str, torch.Tensor]] = None,
-        done_mask: Optional[torch.Tensor] = None # (B,) bool or 0/1; True resets sequence BEFORE appending current token
-    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
-        B = state.size(0)
-        device = state.device
+        hidden: Optional[Dict[str, torch.Tensor]] = None,
+        done_mask: Optional[torch.Tensor] = None # (B,)
+    ) -> Tuple[ConditionalGrassmannMixture, Dict[str, torch.Tensor]]:
+        B, device = state.size(0), state.device
+        hidden = self._maybe_reset_hidden(hidden, B, device)
+        tokens = hidden["tokens"]
+        lengths = hidden["lengths"]
 
-        hidden_state = self._maybe_reset_hidden(hidden_state, B, device)
-        tokens = hidden_state["tokens"]        # (B, Tcap, d)
-        lengths = hidden_state["lengths"]      # (B,)
-
-        if done_mask is not None and bool(done_mask.any().item()):
-
+        if done_mask is not None and self.clear_on_reset and done_mask.any():
             idx = done_mask.nonzero(as_tuple=False).squeeze(-1)
             if idx.numel() > 0:
                 tokens[idx].zero_()
-                if lengths is not None:
-                    lengths[idx] = 0
+                lengths[idx] = 0
 
-        # Project current [s_t, a_t] into token
-        token = self.token_proj(torch.cat([state, action], dim=-1))  # (B, d_model)
+        tok = self.token_proj(torch.cat([state, action], dim=-1))  # (B, d_model)
 
-        # Append to ring buffer (shift-left where full)
-        full_mask = lengths >= self.context_len
-        if full_mask.any():
-            rows = full_mask.nonzero(as_tuple=False).squeeze(-1)
+        # Append with ring-buffer behaviour
+        full = lengths >= self.context_len
+        if full.any():
+            rows = full.nonzero(as_tuple=False).squeeze(-1)
             tokens[rows, :-1, :] = tokens[rows, 1:, :]
-            tokens[rows, -1, :] = token[rows]
-        if (~full_mask).any():
-            rows = (~full_mask).nonzero(as_tuple=False).squeeze(-1)
+            tokens[rows, -1, :] = tok[rows]
+        if (~full).any():
+            rows = (~full).nonzero(as_tuple=False).squeeze(-1)
             pos = lengths[rows]
-            tokens[rows, pos, :] = token[rows]
+            tokens[rows, pos, :] = tok[rows]
             lengths[rows] = pos + 1
 
-        # Effective sequence length
         T = int(lengths.max().item())
         T = max(1, min(T, self.context_len))
-
-        # Slice valid window and build masks
-        x = tokens[:, :T, :]                          # (B, T, d)
-        x = x + self.pos_embed[:T, :].unsqueeze(0)
-        src_kpm = self._key_padding_mask(lengths, T)  # (B, T) True=pad
-        causal = self._causal_mask(T, device)         # (T, T)
+        x = tokens[:, :T, :] + self.pos_embed[:T, :].unsqueeze(0)
+        src_kpm = self._key_padding_mask(lengths, T)
+        causal = self._causal_mask(T, device)
 
         # Encoder
-        with self._sdpa_backend_ctx():
-            if self.use_checkpointing:
-                amp_enabled = torch.is_autocast_enabled()
-                amp_dtype = None
-                try:
-                    amp_dtype = torch.get_autocast_gpu_dtype()
-                except Exception:
-                    pass
-              
-                def run_layer(y, layer, cm, kpm):
-                    # Match autocast state exactly during recompute
-                    device_type = "cuda" if y.is_cuda else "cpu"
-                    with torch.amp.autocast(device_type=device_type,
-                                            enabled=amp_enabled,
-                                            dtype=(amp_dtype if device_type == "cuda" else None)):
-                         # Boolean src_mask; do NOT pass is_causal to avoid path switches
-                        return layer(y, src_mask=cm, src_key_padding_mask=kpm)
+        x = self.encoder(x, mask=causal, src_key_padding_mask=src_kpm)
+        idx = (lengths - 1).clamp(min=0, max=T - 1)
+        h = x[torch.arange(B, device=device), idx, :]           # (B, d_model)
 
-                
-                for layer in self.encoder.layers:
-                    x = torch.utils.checkpoint.checkpoint(
-                        run_layer, x, layer, causal, src_kpm, use_reentrant=False, preserve_rng_state=True
-                    )
+        feat = self.trunk(h)
 
-                if self.encoder.norm is not None:
-                    x = self.encoder.norm(x)
-            else:
-                # Also use KWARGS here for stability across versions
-                x = self.encoder(x, mask=causal, src_key_padding_mask=src_kpm)
-        # Last VALID token per item
-        idx = (lengths - 1).clamp(min=0, max=T - 1)          # (B,)
-        h = x[torch.arange(B, device=device), idx, :]        # (B, d)
+        logits = self.head_logits(feat)                          # (B, K)
+        U_raw = self.head_U(feat).view(B, self.K, self.D, self.r)
+        m = self.head_m(feat).view(B, self.K, self.r)
+        logs = self.head_logs(feat).view(B, self.K, 2)
+        log_sigma_par = logs[..., 0].clamp_(self.logsig_min, self.logsig_max)
+        log_sigma_perp = logs[..., 1].clamp_(self.logsig_min, self.logsig_max)
 
-        # Predict next state distribution
-        out = self.head(h)                                   # (B, 2*S)
-        mean_state, log_var_state = torch.chunk(out, 2, dim=-1)
-
-        next_state_mean = state + mean_state if self.residual else mean_state
-        next_state_logvar = torch.clamp(log_var_state, min=self.logvar_min, max=self.logvar_max)
-
+        prior = ConditionalGrassmannMixture(logits, U_raw, m, log_sigma_par, log_sigma_perp)
         new_hidden = {"tokens": tokens, "lengths": lengths}
-        return next_state_mean, next_state_logvar, new_hidden
+        return prior, new_hidden

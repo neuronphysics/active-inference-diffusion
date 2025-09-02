@@ -343,40 +343,45 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
                 encoded_obs, frame_idx=frame_idx, actions=prev_acts
             )
             latents      = belief_now['latent']
-            latents_mean = belief_now['latent_mean']
-            latents_std  = belief_now['latent_std']
+            
 
             belief_next = self.active_inference.update_belief_via_diffusion(
                 encoded_next_obs, frame_idx=frame_idx + 1, actions=actions
             )
             next_latents = belief_next['latent']
 
-        torch.nn.utils.clip_grad_norm_(
-            self.active_inference.latent_score_network.parameters(), max_norm=1.0
-        )
-
         # -------------------------
         # 1a) Diffusion ELBO (+ contrastive) — UNWEIGHTED (uniform batch)
         # -------------------------
         self.score_optimizer.zero_grad()
-        elbo_loss, elbo_info = self.active_inference.compute_diffusion_elbo(
-            encoded_obs, rewards, raw_observations=obs, frame_index=frame_idx, actions=prev_acts
-        )
+        
+         # Unfreeze prior during policy/value updates
 
         hidden_states = self.active_inference.reset_dynamics_hidden(B0)
         hidden_states = self.active_inference._reset_done_hidden(hidden_states, dones)
 
-        contrastive_loss = self.compute_representation_loss(
-            encoded_obs, encoded_next_obs, actions, latents, hidden_states
+        elbo_loss, elbo_info = self.active_inference.compute_diffusion_elbo(
+            observations=encoded_obs,
+            next_observations=encoded_next_obs,
+            actions=actions,
+            latents=latents,
+            next_latents=next_latents,
+            raw_observations=obs,
+            next_raw_observations=next_obs,
+            frame_index=frame_idx,
+            previous_actions=prev_acts,
+            done_mask=dones,
+            hidden_state=hidden_states
         )
 
-        total_loss = elbo_loss + self.config.contrastive_weight * contrastive_loss
-        total_loss.backward()
+
+        elbo_loss.backward()
 
         torch.nn.utils.clip_grad_norm_(
             list(self.active_inference.latent_score_network.parameters()) +
             list(self.active_inference.latent_diffusion.parameters()) +
             list(self.encoder.parameters()) +
+            list(self.active_inference.dvkl.T.parameters()) +
             list(self.active_inference.feature_decoder.parameters()) +
             (list(self.active_inference.observation_decoder.parameters())
             if isinstance(self.active_inference.observation_decoder, torch.nn.Module) else []),
@@ -384,16 +389,19 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
         )
         self.score_optimizer.step()
         self.score_ema.update()
-
         metrics.update({k: (float(v) if torch.is_tensor(v) else v) for k, v in elbo_info.items()})
-        metrics['contrastive_loss'] = float(contrastive_loss.detach())
-        metrics['total_loss']       = float(total_loss.detach())
+
+        metrics['total_loss']       = float(elbo_loss.detach())
+        # --- Train DVKL critic T and fit the Grassmann prior ---
 
         # -------------------------
         # 1b) Policy (EFE) — UNWEIGHTED (uniform batch)
         # -------------------------
         self.policy_optimizer.zero_grad()
-        self.active_inference.latent_dynamics.train()
+        # Freeze all except policy network
+        for p in self.encoder.parameters(): p.requires_grad_(False)
+        for p in self.active_inference.parameters(): p.requires_grad_(False)
+        for p in self.active_inference.policy_network.parameters(): p.requires_grad_(True)
 
         efe, efe_info = self.active_inference.compute_expected_free_energy_diffusion(
             latents, horizon=self.config.efe_horizon
@@ -402,10 +410,20 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
         policy_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.active_inference.policy_network.parameters(), self.config.gradient_clip)
         self.policy_optimizer.step()
-
+        for p in self.encoder.parameters(): p.requires_grad_(True)
+        for p in self.active_inference.parameters(): p.requires_grad_(True)
         metrics['policy_loss'] = float(policy_loss.detach())
         metrics.update({f'efe_{k}': (float(v) if torch.is_tensor(v) else v) for k, v in efe_info.items()})
-
+        # -------------------------
+        # Train reward predictor
+        # -------------------------
+        self.reward_optimizer.zero_grad(set_to_none=True)
+        _, _, reward_dist = self.active_inference.predict_reward_from_latent(latents.detach())
+        reward_loss = -reward_dist.log_prob(rewards).mean()  # Negative log-likelihood
+        reward_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.active_inference.reward_predictor.parameters(), self.config.gradient_clip)
+        self.reward_optimizer.step()
+        metrics['reward_loss'] = float(reward_loss.detach())
         # -------------------------
         # 1c) Value (critic) with EMA bootstrap — UNWEIGHTED (uniform batch)
         # -------------------------
@@ -433,7 +451,7 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
         # (optional) epistemic estimator every few steps
         if self.total_steps % 5 == 0:
             epistemic_mi, epistemic_metrics = self.active_inference.train_epistemic_estimator(
-                latents, actions, next_latents
+                latents, actions, hidden_state=hidden_states, done_mask=dones
             )
             metrics['epistemic_mi'] = float(epistemic_mi)
             metrics.update({f'ep_{k}': (float(v) if torch.is_tensor(v) else v) for k, v in epistemic_metrics.items()})
@@ -515,11 +533,11 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
                         d = seq_batch['dones'][:, :T-1].float().to(self.device)   # [B, T-1]
                         gamma = float(self.config.discount_factor)
                         td = r + gamma * (1.0 - d) * v_all[:, 1:] - v_all[:, :-1] # [B, T-1]
-
+                   
                         # Per-sequence dynamics NLL (masked mean)
                         t_idx = torch.arange(T-1, device=self.device).unsqueeze(0).expand(B, -1)
                         mask = (t_idx < (seq_batch['lengths'].to(self.device).unsqueeze(1) - 1)).float()  # [B, T-1]
-
+                        td = td * mask  # Mask invalid steps
                         per_seq_sum = torch.zeros(B, device=self.device)
                         per_seq_cnt = torch.zeros(B, device=self.device)
                         log_2pi = math.log(2.0 * math.pi)
@@ -528,10 +546,8 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
                             nxt = latent_sequences[:, t + 1]                # [B, D]
                             act = seq_batch['actions'][:, t].to(self.device) # [B, A]
 
-                            mean_t, logv_t, _ = self.active_inference.predict_next_latent(cur, act, None)
-                            step_nll = 0.5 * (
-                                log_2pi + logv_t + (nxt - mean_t).pow(2) / logv_t.exp()
-                            ).sum(dim=-1)  # [B]
+                            next_latents_dist, _ = self.active_inference.predict_next_latent(cur, act, None)
+                            step_nll = -next_latents_dist.log_prob(nxt)
 
                             m = mask[:, t]
                             per_seq_sum += step_nll * m
@@ -557,35 +573,6 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
         self.total_steps += 1
         return metrics
 
-    def compute_representation_loss(
-        self,
-        obs: torch.Tensor,
-        next_obs: torch.Tensor,
-        actions: torch.Tensor,
-        latents: torch.Tensor,
-        hidden_states: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-    ) -> torch.Tensor:
-        """
-        Contrastive loss for visual representation learning
-        Ensures latent dynamics align with visual features
-        """
-        status_training= self.active_inference.latent_dynamics.training
-        self.active_inference.latent_dynamics.train()
-        # Predict next visual features from current latent and action
-        predicted_next_latent, predicted_logvar, hidden_states = self.active_inference.predict_next_latent(latents, actions, hidden_states)
-        
-        self.active_inference.latent_dynamics.train(status_training)
-        predicted_std = torch.exp(0.5 * predicted_logvar)
-        # Normalize for contrastive loss
-        pred_norm = F.normalize(predicted_next_latent, dim=-1)
-        target_norm = F.normalize(next_obs, dim=-1)
-        uncertainty_weights = 1.0 / (1.0 + predicted_std.mean(dim=-1, keepdim=True))        
-        # InfoNCE loss
-        logits = torch.matmul(pred_norm, target_norm.T) / 0.1
-        weighted_logits = logits * uncertainty_weights
-        labels = torch.arange(obs.shape[0], device=obs.device)
-
-        return F.cross_entropy(weighted_logits, labels)
 
     def _setup_optimizers(self):
         """Setup optimizers including visual components"""
@@ -597,16 +584,23 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
         else:
             decoder_params = list(self.active_inference.observation_decoder.parameters())
 
-        self.score_optimizer = torch.optim.AdamW(
-            list(self.active_inference.latent_score_network.parameters()) +
-            list(self.active_inference.latent_diffusion.parameters()) +
-            list(self.encoder.parameters())+
-            list(self.active_inference.feature_decoder.parameters())+
-            decoder_params,
-            lr=self.config.learning_rate,
-            weight_decay=1e-5
+        model_params = list(self.active_inference.latent_score_network.parameters()) + \
+                       list(self.active_inference.latent_diffusion.parameters()) + \
+                       list(self.encoder.parameters()) + \
+                       list(self.active_inference.feature_decoder.parameters()) + \
+                       decoder_params
+        dv_params    = list(self.active_inference.dvkl.T.parameters())
+        self.score_optimizer = torch.optim.AdamW([
+            {"params": model_params, "lr": self.config.learning_rate, "weight_decay": 1e-5},
+            {"params": dv_params,    "lr": self.config.dv_lr,         "weight_decay": 0.0},
+        ], betas=(0.9, 0.999))
+
+        #reward predictor optimizer
+        self.reward_optimizer = torch.optim.AdamW(
+            self.active_inference.reward_predictor.parameters(),
+            lr=self.config.learning_rate, betas=(0.9, 0.999), weight_decay=1e-6
         )
-        
+
         # Policy optimizer
         self.policy_optimizer = torch.optim.AdamW(
             self.active_inference.policy_network.parameters(),
@@ -623,9 +617,7 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
         
         # Dynamics optimizer
         self.dynamics_optimizer = torch.optim.AdamW(
-            list(self.active_inference.latent_dynamics.parameters()) +
-            list(self.active_inference.observation_decoder.parameters())+
-            list(self.active_inference.reward_predictor.parameters()),
+            self.active_inference.latent_dynamics.parameters(),
             lr=self.config.learning_rate
         )
         #Add epistemic optimizer
