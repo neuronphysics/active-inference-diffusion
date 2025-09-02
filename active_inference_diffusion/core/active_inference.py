@@ -767,7 +767,7 @@ class DiffusionActiveInference(nn.Module):
             **belief_info,
             "expected_free_energy": efe.mean().cpu().item(),
             "action_log_prob": log_prob.mean().cpu().item(),
-            "policy_entropy": policy_dist.entropy().sum(dim=-1).mean().cpu().item(),
+            "policy_entropy": policy_dist.get_policy_entropy(latent).sum(dim=-1).mean().cpu().item(),
             **{
                 k: v.cpu().item() if torch.is_tensor(v) else v
                 for k, v in efe_info.items()
