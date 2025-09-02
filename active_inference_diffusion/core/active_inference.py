@@ -646,13 +646,9 @@ class DiffusionActiveInference(nn.Module):
         actions = actions.to(self.device)
         done_mask = done_mask.to(self.device) if done_mask is not None else None
         # Predict next latent distribution
-        next_latent_dist=self.predict_next_latent(
-            latents,
-            actions,
-            hidden_state,
-            done_mask
-        )
-        next_latents, _ = next_latent_dist.sample(B=latents.shape[0], hard=False, device=self.device)  # Reparameterized sample
+        next_latent_dist, _ = self.predict_next_latent(latents, actions, hidden_state, done_mask)
+        next_latents, _ = next_latent_dist.sample(B=latents.shape[0], hard=False, device=self.device)
+
         # Compute MINE loss (negative MI for minimization)
         mi_estimate, metrics = self.epistemic_estimator(next_latents)
         total_loss = -mi_estimate.mean()
