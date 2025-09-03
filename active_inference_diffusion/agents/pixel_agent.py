@@ -15,6 +15,7 @@ from ..core.active_inference import DiffusionActiveInference, EMAModel
 from ..encoder.visual_encoders import RandomShiftAugmentation, DrQV2Encoder
 from ..encoder.state_encoders import EncoderFactory
 from ..utils.buffers import ReplayBuffer, SequenceReplayBuffer, PrioritizedSequenceReplayBuffer
+from ..utils.util import _normalize_metrics
 from ..configs.config import (
     ActiveInferenceConfig,
     PixelObservationConfig,
@@ -389,7 +390,7 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
         )
         self.score_optimizer.step()
         self.score_ema.update()
-        metrics.update({k: (float(v) if torch.is_tensor(v) else v) for k, v in elbo_info.items()})
+        metrics.update(_normalize_metrics(elbo_info))
 
         metrics['total_loss']       = float(elbo_loss.detach())
         # --- Train DVKL critic T and fit the Grassmann prior ---
@@ -413,7 +414,7 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
         for p in self.encoder.parameters(): p.requires_grad_(True)
         for p in self.active_inference.parameters(): p.requires_grad_(True)
         metrics['policy_loss'] = float(policy_loss.detach())
-        metrics.update({f'efe_{k}': (float(v) if torch.is_tensor(v) else v) for k, v in efe_info.items()})
+        metrics.update(_normalize_metrics(efe_info, 'efe_'))
         # -------------------------
         # Train reward predictor
         # -------------------------
@@ -454,7 +455,7 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
                 latents, actions, hidden_state=hidden_states, done_mask=dones
             )
             metrics['epistemic_mi'] = float(epistemic_mi)
-            metrics.update({f'ep_{k}': (float(v) if torch.is_tensor(v) else v) for k, v in epistemic_metrics.items()})
+            metrics.update(_normalize_metrics(epistemic_metrics, 'ep_'))
 
         # ===========================================
         # 2) PER-enabled sequence dynamics every N steps
@@ -567,8 +568,7 @@ class DiffusionPixelAgent(BaseActiveInferenceAgent):
                     self.replay_buffer.update_priorities(tree_idx, priorities)
 
                 # Log sequence metrics
-                metrics.update({f'seq_{k}': (float(v) if torch.is_tensor(v) else v)
-                                for k, v in dynamics_metrics.items()})
+                metrics.update(_normalize_metrics(dynamics_metrics, 'seq_'))
 
         self.total_steps += 1
         return metrics

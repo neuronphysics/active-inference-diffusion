@@ -19,7 +19,7 @@ from ..models.value_networks import ValueNetwork
 from ..models.dynamics_models import LatentDynamicsModel, TransformerDynamicsModel
 from .free_energy import FreeEnergyComputation
 from .divergence import DVKL
-from ..utils.util import symexp, symlog, DiscDist
+from ..utils.util import symexp, symlog, DiscDist, hidden_state_norm
 HiddenState = Union[Tuple[torch.Tensor, torch.Tensor], Dict[str, torch.Tensor], None]
 
 class DiffusionActiveInference(nn.Module):
@@ -885,6 +885,7 @@ class DiffusionActiveInference(nn.Module):
             complexity=kl_loss.detach(),
             accuracy=accuracy_info["accuracy"]
         )
+        h_ =hidden_state_norm(hidden)
         info = {
             "reconstruction_loss": accuracy_info["reconstruction_mse"].item(),
             "kl_loss": kl_loss.item(),
@@ -892,9 +893,10 @@ class DiffusionActiveInference(nn.Module):
             "elbo": elbo.item(),
             "mean_time": t.mean().item(),
             "loss_weight_mean": loss_weight.mean().item(),
-            "hidden_state":hidden
+            
         }
-
+        if h_ is not None:
+            info["hidden_state"]= h_
         return -elbo, info  # Return negative ELBO as loss
 
 
@@ -1351,7 +1353,7 @@ class FunctionSpaceEpistemicEstimator(nn.Module):
         z_samples = z_samples + torch.randn_like(z_samples)  # [S*B, Dz]
 
         # JVP features → projector (checkpoint if enabled & grad flows)
-        jac_feats = self._compute_chunked_jvp(z_samples)                        # [S*B, N*F]
+        jac_feats = self._compute_chunked_jvp(z_samples).detach()                        # [S*B, N*F]
         jac_proj  = self._maybe_checkpoint(self.jacobian_projector,
                                            jac_feats, self.cp_jacproj)      # [S*B, jac_dim]
 

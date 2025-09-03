@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from typing import Optional, Union, Tuple
 import matplotlib
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes  # add at top of file or inside function
+from collections.abc import Mapping, Sequence
 
 matplotlib.use("Agg")
 class SpatialAttentionAggregator(nn.Module):
@@ -457,4 +458,50 @@ class DiscDist:
 
         return (target * log_pred).sum(-1)
 
+def hidden_state_norm(hidden):
 
+    def _collect_tensors(x):
+        if torch.is_tensor(x):
+            return [x]
+        if isinstance(x, Mapping):
+            ts = []
+            for v in x.values():
+                ts.extend(_collect_tensors(v))
+            return ts
+        if isinstance(x, Sequence) and not isinstance(x, (str, bytes)):
+            ts = []
+            for v in x:
+                ts.extend(_collect_tensors(v))
+            return ts
+        return []
+
+    tensors = _collect_tensors(hidden)
+    if not tensors:
+        return None  # <-- don’t pretend it’s zero; no tensors present
+
+    # mean of per-tensor norms
+    return torch.stack([t.detach().norm() for t in tensors]).mean().item()
+
+def _normalize_metrics(src_dict, prefix: str = ""):
+    """Return a flat {prefix+key: float} dict from a metrics-like mapping.
+    - Skips dict/list/tuple values (e.g., hidden states)
+    - Converts tensors to scalars via detach().item() if scalar else mean().item()
+    - Casts numeric types to float; skips anything non-numeric
+    """
+
+    out = {}
+    for k, v in (src_dict or {}).items():
+        if isinstance(v, (dict, list, tuple)):
+            continue
+        if torch.is_tensor(v):
+            v_det = v.detach()
+            val = v_det.item() if v_det.numel() == 1 else v_det.float().mean().item()
+        elif isinstance(v, (int, float, np.floating, np.integer)):
+            val = float(v)
+        else:
+            try:
+                val = float(v)
+            except Exception:
+                continue
+        out[(prefix + str(k))] = val
+    return out
