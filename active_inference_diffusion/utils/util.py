@@ -460,6 +460,7 @@ class DiscDist:
 
 def hidden_state_norm(hidden):
 
+
     def _collect_tensors(x):
         if torch.is_tensor(x):
             return [x]
@@ -477,10 +478,14 @@ def hidden_state_norm(hidden):
 
     tensors = _collect_tensors(hidden)
     if not tensors:
-        return None  # <-- don’t pretend it’s zero; no tensors present
-
-    # mean of per-tensor norms
-    return torch.stack([t.detach().norm() for t in tensors]).mean().item()
+        return None
+    norms = []
+    for t in tensors:
+        t = t.detach()
+        if not (torch.is_floating_point(t) or torch.is_complex(t)):
+            t = t.to(torch.float32)   # cast Long/Int/Bool
+        norms.append(torch.linalg.vector_norm(t))
+    return torch.stack(norms).mean().item()
 
 def _normalize_metrics(src_dict, prefix: str = ""):
     """Return a flat {prefix+key: float} dict from a metrics-like mapping.
