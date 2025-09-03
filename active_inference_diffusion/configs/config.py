@@ -21,7 +21,10 @@ class DiffusionConfig:
     annealing_steps: int = 100000
     gradient_clip_val: float = 0.1
     inference_steps: Optional[int] = 100  # None means use DDPM
-    ddim_eta: float = 0.3  # Eta for DDIM, 0.0 means deterministic
+    ddim_eta: float = 1.0  # Eta for DDIM, 0.0 means deterministic
+    use_vdm_times: bool = True      # use a linear grid in log-SNR (γ) like VDM
+    clip_x0_at_sample: bool = False # clip \hat{x}_0 in sampler to [-1,1] like VDM
+
     
 @dataclass
 class BeliefDynamicsConfig:

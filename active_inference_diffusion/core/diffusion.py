@@ -120,7 +120,9 @@ class LatentDiffusionProcess(nn.Module):
             alphas_cumprod = torch.cos(((x / steps) + s) / (1 + s) * np.pi * 0.5) ** 2
             alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
             betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-            betas = torch.clamp(betas, min=1e-4, max=0.999)
+            betas = torch.clamp(betas, min=1e-4, max=0.9999)
+            gamma = torch.log((1.0 - alphas_cumprod) / torch.clamp(alphas_cumprod, min=1e-8))
+            self.register_buffer('gamma', gamma)
         elif self.config.beta_schedule == "linear":
             betas = torch.linspace(
                 self.config.beta_start,
@@ -202,7 +204,8 @@ class LatentDiffusionProcess(nn.Module):
             )
         else:
             # Use DDIM sampling with fewer steps
-            eta = self.ddim_eta if not deterministic else 0.0
+            use_vdm = getattr(self.config, "use_vdm_times", False)
+            eta = (1.0 if use_vdm else self.ddim_eta) if not deterministic else 0.0
             return self._generate_trajectory_ddim(
                 score_network, batch_size, observation, self.inference_steps, eta,
                 frame_time, action, force_drop_action
@@ -261,9 +264,20 @@ class LatentDiffusionProcess(nn.Module):
         
         # Create subsequence of timesteps
         # This is the key to DDIM's speed - we skip steps!
-        step_ratio = max(1, self.config.num_diffusion_steps // inference_steps)
-        timesteps = list(range(0, self.config.num_diffusion_steps, step_ratio))[::-1]
-        
+        # Create subsequence of timesteps (VDM-aligned if desired)
+        if getattr(self.config, "use_vdm_times", False):
+            # VDM: linear grid in log-SNR γ, from high noise → low noise
+            g = self.gamma                        # shape: [num_steps]
+            g0, gT = g[0].item(), g[-1].item()      # γ at t=0..T per your buffers
+            g_grid = torch.linspace(g0, gT, inference_steps + 1, device=g.device)
+            # Snap each γ on the grid to the nearest discrete timestep index
+            idx = torch.stack([torch.argmin((g - val).abs()) for val in g_grid])
+            timesteps = idx.flip(0).tolist()        # reverse: T→…→0
+        else:
+            # Original evenly-spaced index skipping
+            step_ratio = max(1, self.config.num_diffusion_steps // inference_steps)
+            timesteps = list(range(0, self.config.num_diffusion_steps, step_ratio))[::-1]  
+       
         z = torch.randn(batch_size, self.latent_dim, device=device)
         trajectory = [z]
         
@@ -390,7 +404,8 @@ class LatentDiffusionProcess(nn.Module):
         sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t)
         eps_hat = -sqrt_one_minus_alpha_t * score
         pred_z0 = (z_t - sqrt_one_minus_alpha_t * eps_hat) / torch.sqrt(alpha_t)
-
+        if getattr(self.config, 'clip_x0_at_sample', False):
+            pred_z0 = pred_z0.clamp_(-1.0, 1.0)
         # Compute variance for this step (this is where eta comes in!)
         sigma_t = eta * torch.sqrt(torch.clamp((1 - alpha_next) / (1 - alpha_t) * (1 - alpha_t / alpha_next), min=0))
 
