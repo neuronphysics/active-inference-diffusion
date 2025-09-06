@@ -87,7 +87,7 @@ class BaseActiveInferenceAgent(ABC):
         self.total_steps = 0
         self.episode_count = 0
         self.exploration_noise = training_config.exploration_noise
-        self.reward_normalizer = RunningMeanStd(shape=())
+        
         
     @abstractmethod
     def _setup_dimensions(self):
@@ -106,38 +106,8 @@ class BaseActiveInferenceAgent(ABC):
         
     def _setup_optimizers(self):
         """Setup optimizers"""
-        # Score network optimizer
-        self.score_optimizer = torch.optim.Adam(
-            self.active_inference.score_network.parameters(),
-            lr=self.config.learning_rate
-        )
-        
-        # Policy optimizer
-        self.policy_optimizer = torch.optim.Adam(
-            self.active_inference.policy_network.parameters(),
-            lr=self.config.learning_rate
-        )
-        
-        # Value optimizer
-        self.value_optimizer = torch.optim.Adam(
-            self.active_inference.value_network.parameters(),
-            lr=self.config.learning_rate
-        )
-        
-        # Dynamics optimizer
-        self.dynamics_optimizer = torch.optim.Adam(
-            list(self.active_inference.dynamics_model.parameters()) +
-            list(self.active_inference.reward_predictor.parameters()),
-            lr=self.config.learning_rate
-        )
-        #Add epistemic optimizer
-        self.epistemic_optimizer = torch.optim.Adam(
-            self.active_inference.epistemic_estimator.parameters(),
-            lr=self.config.learning_rate*0.1,
-            weight_decay=1e-5
-        )
-        self.active_inference.epistemic_optimizer = self.epistemic_optimizer
-        
+        pass
+                
     def act(
         self,
         observation: np.ndarray,

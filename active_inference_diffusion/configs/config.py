@@ -10,7 +10,7 @@ import torch
 @dataclass
 class DiffusionConfig:
     """Configuration for diffusion process"""
-    num_diffusion_steps: int = 1000
+    num_diffusion_steps: int = 400
     beta_start: float = 1e-4
     beta_end: float = 0.02
     beta_schedule: str = "cosine"  # Options: "cosine", "linear"
@@ -20,6 +20,8 @@ class DiffusionConfig:
     time_annealing_end: float = 0.1
     annealing_steps: int = 100000
     gradient_clip_val: float = 0.1
+    inference_steps: Optional[int] = 100  # None means use DDPM
+    ddim_eta: float = 0.3  # Eta for DDIM, 0.0 means deterministic
     
 @dataclass
 class BeliefDynamicsConfig:
@@ -46,26 +48,26 @@ class ActiveInferenceConfig:
     precision_init: float = 1.0
     expected_free_energy_horizon: int = 5
     efe_horizon: int = 5  # Alias for compatibility
-    epistemic_weight: float = 0.1
+    epistemic_weight: float = 0.6
     extrinsic_weight: float = 1.0
     pragmatic_weight: float = 1.0  # 
     consistency_weight: float = 0.1  # latent policy coherence
     discount_factor: float = 0.99
     contrastive_weight: float = 0.5  # for latent policy coherence
     # Diffusion integration
-    kl_weight: float = 0.1  # kl regularization for diffusion
+    kl_weight: float = 0.9  # kl regularization for diffusion
     diffusion_weight: float = 1.0  # score matching weight
     reward_weight:float = 0.5  # reward scaling
     # Model architecture
-    hidden_dim: int = 512
-    latent_dim: int = 128
-    spatial_aggregator_output_dim:int = 256
-    num_layers: int = 3
+    hidden_dim: int = 128
+    latent_dim: int = 96
+    spatial_aggregator_output_dim:int = 32
+    num_layers: int = 2
     pixel_observation: bool = False  # Use pixel observations
     # Training
     batch_size: int = 256
     learning_rate: float = 5e-5
-    gradient_clip: float = 0.5  # Gradient clipping value
+    gradient_clip: float = 1.0  # Gradient clipping value
 
     # Reward-oriented Active Inference parameters
     preference_temperature: float = 1.0  # τ in P(o) ∝ exp(r(o)/τ)
@@ -74,14 +76,29 @@ class ActiveInferenceConfig:
     max_preference_temperature: float = 10.0  # Upper bound for exploration
     temperature_decay: float = 0.995  # Exponential decay per episode
     use_reward_preferences: bool = True  # Enable reward-oriented EFE
-    
+    #Dynamics model parameters
+    dynamics_type = "transformer"
+    dynamics_context_len = 16
+    dynamics_num_layers = 2
+    dynamics_n_heads = 4
+    dynamics_dropout = 0.0
+    dynamics_residual = True
+    dynamics_use_checkpointing = True
+    dynamics_attn_impl = "mem"       # good on 11GB cards
+
+    # Value network parameters
+    num_value_bins: int = 255  # Number of bins for categorical value distribution
+    value_net_num_layers: int = 2  # Number of hidden layers in value network
     # Preference shaping parameters
     baseline_reward: float = 0.0  # Baseline for reward centering
     preference_momentum: float = 0.9  # EMA for reward statistics    
     # Nested configs
     diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
     belief_dynamics: BeliefDynamicsConfig = field(default_factory=BeliefDynamicsConfig)
-    
+    frame_stack: int = 3
+    #
+    reward_disc_low: float = -10.0
+    reward_disc_high: float = 10.0
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -93,6 +110,7 @@ class PixelObservationConfig:
     encoder_type: str = "drqv2"  # drqv2, impala, attention
     encoder_feature_dim: int = 80
     augmentation: bool = True
+    num_layers: int = 3
     random_shift_pad: int = 4
     pixel_observation:  bool = True  # Use pixel observations
     
@@ -117,6 +135,13 @@ class TrainingConfig:
     train_frequency: int = 2
     gradient_steps: int = 4
     num_parallel_envs: int = 6  # Number of parallel environments for training
+    # prioritized replay parameters
+    sequence_length: int = 10
+    alpha: float = 0.6
+    beta0: float = 0.4
+    beta1: float = 0.4
+    beta_frms: int = 100_000
+    eps: float = 1e-6
     # Evaluation
     num_eval_episodes: int = 10
     
@@ -124,3 +149,4 @@ class TrainingConfig:
     use_wandb: bool = True
     project_name: str = "active-inference-diffusion"
     experiment_name: Optional[str] = None
+    prioritized_seq_replay:bool = True

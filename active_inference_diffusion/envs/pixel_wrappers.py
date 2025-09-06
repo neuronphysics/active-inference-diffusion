@@ -4,6 +4,8 @@ from gymnasium.spaces import Box
 from typing import Optional, Tuple, Dict, Any
 import warnings
 from .wrappers import ActionRepeat 
+import os
+
 
 class MuJoCoPixelObservationWrapper(gym.ObservationWrapper):
     """

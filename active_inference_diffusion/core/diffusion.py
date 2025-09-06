@@ -52,6 +52,8 @@ class LatentDiffusionProcess(nn.Module):
         # Loss weight annealing
         self.register_buffer('loss_weight_cache', torch.zeros(1000))
         self.loss_weight_computed = False
+        self.inference_steps = config.inference_steps if hasattr(config, 'inference_steps') else 1000
+        self.ddim_eta = getattr(config, 'ddim_eta', 0.3)
         
     def compute_log_snr(self, t: torch.Tensor) -> torch.Tensor:
         """Compute log signal-to-noise ratio for continuous time"""
@@ -63,7 +65,9 @@ class LatentDiffusionProcess(nn.Module):
         self,
         z_start: torch.Tensor,
         t: torch.Tensor,  # Now continuous in [0, 1]
-        noise: Optional[torch.Tensor] = None
+        noise: Optional[torch.Tensor] = None,
+        frame_time: Optional[torch.Tensor] = None,
+        actions: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         """Enhanced q_sample for continuous time"""
         if noise is None:
@@ -85,7 +89,9 @@ class LatentDiffusionProcess(nn.Module):
         info = {
             'log_snr': log_snr,
             'alpha': alpha,
-            'sigma': sigma
+            'sigma': sigma,
+            'frame_time': frame_time,
+            'actions': actions
         }
         
         return z_noisy, noise, info
@@ -147,10 +153,9 @@ class LatentDiffusionProcess(nn.Module):
         """Sample from learned latent prior p_θ(z)"""
         mean = self.latent_prior_mean.unsqueeze(0).expand(batch_size, -1)
         std = torch.exp(self.latent_prior_log_std).unsqueeze(0).expand(batch_size, -1)
-        
-        eps = torch.randn_like(mean)
-        return mean + std * eps
-        
+
+        return mean, std
+
     def q_sample(
         self,
         z_start: torch.Tensor,
@@ -178,13 +183,50 @@ class LatentDiffusionProcess(nn.Module):
         score_network: nn.Module,
         batch_size: int,
         observation: Optional[torch.Tensor] = None,
-        deterministic: bool = False
+        deterministic: bool = False,
+        frame_time: Optional[torch.Tensor] = None,
+        action: Optional[torch.Tensor] = None,
+        force_drop_action: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         """
         Generate latent trajectory via reverse diffusion
         This is the core innovation - generating belief representations
         """
         device = next(score_network.parameters()).device
+        if frame_time is not None:
+            frame_time = frame_time.to(device)
+        if action is not None:
+            action = action.to(device)
+        if force_drop_action is not None:
+            force_drop_action = force_drop_action.to(device)
+
+        if self.inference_steps is None or self.inference_steps >= self.config.num_diffusion_steps:
+            # Use original DDPM sampling
+            return self._generate_trajectory_ddpm(
+                score_network, batch_size, observation, deterministic, 
+                frame_time, action, force_drop_action
+            )
+        else:
+            # Use DDIM sampling with fewer steps
+            eta = self.ddim_eta if not deterministic else 0.0
+            return self._generate_trajectory_ddim(
+                score_network, batch_size, observation, self.inference_steps, eta,
+                frame_time, action, force_drop_action
+            )
+
+    def _generate_trajectory_ddpm(
+        self,
+        score_network: nn.Module,
+        batch_size: int,
+        observation: Optional[torch.Tensor] = None,
+        deterministic: bool = False,
+        frame_time: Optional[torch.Tensor] = None,
+        action: Optional[torch.Tensor] = None,
+        force_drop_action: Optional[torch.Tensor] = None
+    ) -> List[torch.Tensor]:
+        """Original DDPM sampling (your existing code, just moved here)"""
+        device = next(score_network.parameters()).device
+
         # Ensure observation is on correct device
         if observation is not None:
             observation = observation.to(device)
@@ -195,17 +237,92 @@ class LatentDiffusionProcess(nn.Module):
         # Reverse diffusion process
         for t in reversed(range(self.config.num_diffusion_steps)):
             t_batch = torch.full((batch_size,), t, device=device, dtype=torch.long)
-            
+            t_batch = torch.clamp(t_batch, 0, self.config.num_diffusion_steps - 1)
             # Predict score conditioned on observation
-            score = score_network(z, t_batch.float(), observation)
+            score = score_network(z, t_batch, observation,
+                                  frame_time=frame_time, 
+                                  action=action,
+                                  force_drop_action=force_drop_action)
             
             # Update latent
             z = self.p_sample(z, t_batch, score, deterministic=deterministic)
             trajectory.append(z)
             
         return trajectory
+    def _generate_trajectory_ddim(
+        self,
+        score_network: nn.Module,
+        batch_size: int,
+        observation: Optional[torch.Tensor],
+        inference_steps: int,
+        eta: float,
+        frame_time: Optional[torch.Tensor] = None,
+        action: Optional[torch.Tensor] = None,
+        force_drop_action: Optional[torch.Tensor] = None
+    ) -> List[torch.Tensor]:
+        """DDIM sampling with configurable stochasticity"""
+        device = next(score_network.parameters()).device
+        if observation is not None:
+            observation = observation.to(device)
         
+        # Create subsequence of timesteps
+        # This is the key to DDIM's speed - we skip steps!
+        step_ratio = max(1, self.config.num_diffusion_steps // inference_steps)
+        timesteps = list(range(0, self.config.num_diffusion_steps, step_ratio))[::-1]
+        
+        z = torch.randn(batch_size, self.latent_dim, device=device)
+        trajectory = [z]
+        
+        for i in range(len(timesteps) - 1):
+            t = timesteps[i]
+            t_next = timesteps[i + 1]
+            
+            t_batch = torch.full((batch_size,), t, device=device, dtype=torch.long)
+            score = score_network(z, t_batch, observation,
+                                  frame_time=frame_time, 
+                                  action=action,
+                                  force_drop_action=force_drop_action)
+            if torch.isnan(score).any() or torch.isinf(score).any():
+                raise ValueError(f"Score network output contains NaN or Inf values at timestep {t}")
+            
+            # Use modified p_sample that handles DDIM logic
+            z = self.p_sample(z, t_batch, score, 
+                            deterministic=(eta == 0),
+                            t_next=t_next,
+                            eta=eta)
+            trajectory.append(z)
+        
+        # Final step to t=0
+        if timesteps[-1] > 0:
+            t_batch = torch.full((batch_size,), timesteps[-1], device=device, dtype=torch.long)
+            score = score_network(z, t_batch, observation, frame_time=frame_time, action=action, 
+                                  force_drop_action=force_drop_action)
+            z = self.p_sample(z, t_batch, score, 
+                            deterministic=(eta == 0),
+                            t_next=0,
+                            eta=eta)
+            trajectory.append(z)
+            
+        return trajectory
+            
     def p_sample(
+        self,
+        z_t: torch.Tensor,
+        t: torch.Tensor,
+        score: torch.Tensor,
+        deterministic: bool = False,
+        t_next: Optional[int] = None,
+        eta: float = 0.3
+    ) -> torch.Tensor:
+        
+        if t_next is None:
+            # Original DDPM sampling
+            return self._p_sample_ddpm(z_t, t, score, deterministic)
+        else:
+            # DDIM sampling with controllable stochasticity
+            return self._p_sample_ddim(z_t, t, t_next, score, eta)
+        
+    def _p_sample_ddpm(
         self,
         z_t: torch.Tensor,
         t: torch.Tensor,
@@ -224,7 +341,8 @@ class LatentDiffusionProcess(nn.Module):
         sqrt_recip_alphas_t = extract(1.0 / torch.sqrt(self.alphas), t, z_t.shape)
         
         # Predict z_0
-        predicted_z_start = (z_t + sqrt_one_minus_alphas_cumprod_t * score) * sqrt_recip_alphas_t
+        eps_hat =-sqrt_one_minus_alphas_cumprod_t * score
+        predicted_z_start = (z_t - sqrt_one_minus_alphas_cumprod_t * eps_hat) * sqrt_recip_alphas_t
         
         # Compute posterior mean
         posterior_mean = self._posterior_mean(predicted_z_start, z_t, t)
@@ -253,10 +371,49 @@ class LatentDiffusionProcess(nn.Module):
         )
         
         return posterior_mean_coef1 * z_start + posterior_mean_coef2 * z_t
+    
+    def _p_sample_ddim(
+        self,
+        z_t: torch.Tensor,
+        t: torch.Tensor,
+        t_next: int,
+        score: torch.Tensor,
+        eta: float
+    ) -> torch.Tensor:
+        """
+        DDIM sampling step with controllable stochasticity
+        
+        eta controls the amount of stochasticity:
+        - eta = 0: Completely deterministic (pure DDIM)
+        - eta = 1: Equivalent to DDPM
+        - 0 < eta < 1: Partially stochastic (recommended: 0.3-0.5)
+        """
+        # Get alpha values
+        alpha_t = extract(self.alphas_cumprod, t, z_t.shape)
+        alpha_next = self.alphas_cumprod[t_next] if t_next > 0 else torch.ones_like(alpha_t)
+        
+        # Compute the predicted start point
+        sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t)
+        eps_hat = -sqrt_one_minus_alpha_t * score
+        pred_z0 = (z_t - sqrt_one_minus_alpha_t * eps_hat) / torch.sqrt(alpha_t)
 
+        # Compute variance for this step (this is where eta comes in!)
+        sigma_t = eta * torch.sqrt(torch.clamp((1 - alpha_next) / (1 - alpha_t) * (1 - alpha_t / alpha_next), min=0))
+
+        # Compute the "direction" pointing from z_t to z_0
+        pred_dir_zt = torch.sqrt(1 - alpha_next - sigma_t ** 2) * eps_hat
+        # Compute the next sample
+        z_next = torch.sqrt(alpha_next) * pred_z0 + pred_dir_zt
+        # Add noise scaled by sigma_t (this is the stochastic part!)
+        if eta > 0 and t[0] > 0:  # No noise at the final step
+            noise = torch.randn_like(z_t)
+            z_next = z_next + sigma_t * noise
+            
+        return z_next
 
 def extract(a: torch.Tensor, t: torch.Tensor, x_shape: Tuple) -> torch.Tensor:
     """Extract coefficients at timestep t"""
+    t = t.to(device=a.device)
     batch_size = t.shape[0]
     out = a.gather(-1, t)
     return out.reshape(batch_size, *((1,) * (len(x_shape) - 1)))

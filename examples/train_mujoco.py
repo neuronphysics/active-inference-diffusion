@@ -2,7 +2,7 @@
 Training script for Diffusion Active Inference on MuJoCo with GPU-Optimized Parallel Data Collection
 Uses GPUCentralizedCollector for faster diffusion inference during collection
 """
-
+import os
 import torch
 import torch.multiprocessing as mp
 import gymnasium as gym
@@ -11,6 +11,7 @@ from pathlib import Path
 import argparse
 from typing import Dict, Any
 import time
+
 
 from active_inference_diffusion.agents import DiffusionStateAgent, DiffusionPixelAgent
 from active_inference_diffusion.configs.config import (
@@ -31,11 +32,18 @@ from active_inference_diffusion.envs.pixel_wrappers import make_pixel_mujoco
 # Use GPU-optimized collector instead of regular parallel collector
 from active_inference_diffusion.utils.async_collector import GPUCentralizedCollector
 from active_inference_diffusion.utils.util import visualize_reconstruction
+import torch.profiler
+
 import os
+if torch.cuda.is_available():
+    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    torch.backends.cuda.enable_math_sdp(True)
 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True,max_split_size_mb:512'
 os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
 os.environ['MUJOCO_GL'] = 'egl'
+
 
 
 def setup_environment(
@@ -149,15 +157,15 @@ def train_diffusion_active_inference(
     # Create configurations
     config = ActiveInferenceConfig(
         env_name=env_name,
-        latent_dim=32,
-        hidden_dim=128,
-        learning_rate=5e-5,
-        batch_size=64,
+        latent_dim=28,
+        hidden_dim=24,
+        learning_rate=4e-5,
+        batch_size=60,
         efe_horizon=5,
-        epistemic_weight=0.1,
+        epistemic_weight=0.5,
         pragmatic_weight=1.0,
-        consistency_weight=0.1,
-        kl_weight=0.5,
+        consistency_weight=0.5,
+        kl_weight=0.75,
         diffusion_weight=1.0,
         pixel_observation=use_pixels,
         device=device
@@ -165,7 +173,7 @@ def train_diffusion_active_inference(
     
     # Enhanced diffusion config
     config.diffusion = DiffusionConfig(
-        num_diffusion_steps=25,  # Can be reduced to 10 for GPU collector
+        num_diffusion_steps=200,  # TODO: Adjust based on performance
         beta_schedule="cosine",
         beta_start=1e-4,
         beta_end=0.02
@@ -179,7 +187,7 @@ def train_diffusion_active_inference(
         log_frequency=1_000,
         buffer_size=buffer_size,
         learning_starts=5_000,
-        gradient_steps=2,
+        gradient_steps=4,
         exploration_noise=0.1,
         exploration_decay=0.999,
         num_parallel_envs=num_parallel_envs
@@ -326,30 +334,39 @@ def train_diffusion_active_inference(
             
             # Training phase
             if steps_collected > training_config.learning_starts:
-                training_start = time.time()
+                if hasattr(agent.replay_buffer, 'episodes') and len(agent.replay_buffer.episodes) > 0 and len(agent.replay_buffer) >= config.batch_size:
+                    print(f"Training at step {steps_collected}...")
+                    training_start = time.time()
+                    
+                    # Perform gradient updates
+                    num_updates = training_config.gradient_steps 
+                    
+                    train_metrics = {}
+                    for _ in range(num_updates):
+                        metrics = agent.train_step()
+                        for k, v in metrics.items():
+                            if k not in train_metrics:
+                                train_metrics[k] = []
+                            train_metrics[k].append(v)
+                    
+                    # Average training metrics
+                    avg_train_metrics = {}
+                    for k, v in train_metrics.items():
+                        if isinstance(v[0], torch.Tensor):
+                            # Handle torch tensors (move to CPU first)
+                            avg_train_metrics[k] = torch.stack(v).mean().cpu().item()
+                        else:
+                            # Handle regular numbers
+                            avg_train_metrics[k] = np.mean(v)
+                    
+                    training_time = time.time() - training_start
+                    avg_train_metrics['training/time'] = training_time
+                    avg_train_metrics['training/updates_per_second'] = num_updates / training_time
+                    
+                    # Log training metrics
+                    if steps_collected % training_config.log_frequency < collection_steps:
+                        logger.log(avg_train_metrics, steps_collected)
                 
-                # Perform gradient updates
-                num_updates = int(training_config.gradient_steps * collection_stats['steps_collected'])
-                
-                train_metrics = {}
-                for _ in range(num_updates):
-                    metrics = agent.train_step()
-                    for k, v in metrics.items():
-                        if k not in train_metrics:
-                            train_metrics[k] = []
-                        train_metrics[k].append(v)
-                
-                # Average training metrics
-                avg_train_metrics = {k: np.mean(v) for k, v in train_metrics.items()}
-                
-                training_time = time.time() - training_start
-                avg_train_metrics['training/time'] = training_time
-                avg_train_metrics['training/updates_per_second'] = num_updates / training_time
-                
-                # Log training metrics
-                if steps_collected % training_config.log_frequency < collection_steps:
-                    logger.log(avg_train_metrics, steps_collected)
-            
             # Update exploration noise
             agent.update_exploration()
             
@@ -358,10 +375,12 @@ def train_diffusion_active_inference(
                steps_collected % 5000 < collection_steps and len(agent.replay_buffer) > 0:
                 sample_batch = agent.replay_buffer.sample(min(4, len(agent.replay_buffer)))
                 sample_obs = sample_batch['observations']
+                sample_actions = sample_batch['actions']
+                
                 recon_error = visualize_reconstruction(
                     agent,
                     sample_obs,
-                    f"plots/reconstruction_step_{steps_collected}.png"
+                    save_path=f"plots/reconstruction_step_{steps_collected}.png"
                 )
                 logger.log({'reconstruction_error': recon_error}, steps_collected)
             
@@ -448,7 +467,7 @@ if __name__ == "__main__":
     parser.add_argument('--pixels', action='store_true', 
                         help='Use pixel observations')
     parser.add_argument('--timesteps', type=int, default=1_000_000)
-    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--num_parallel_envs', type=int, default=3,
                         help='Number of parallel environments for data collection')

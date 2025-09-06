@@ -122,20 +122,13 @@ class DiffusionStateAgent(BaseActiveInferenceAgent):
         dones = batch['dones'].to(self.device)
         
         metrics = {}
-        # First, update reward normalizer statistics
-        self.reward_normalizer.update(rewards.cpu().numpy())
-
-        # Normalize rewards
-        normalized_rewards = torch.tensor(
-                self.reward_normalizer.normalize(rewards.cpu().numpy()),
-                device=self.device,
-                dtype=torch.float32
-        )
+        
         # 1. Generate latents via diffusion (no gradients needed here)
         with torch.no_grad():
             belief_info = self.active_inference.update_belief_via_diffusion(observations)
             latents = belief_info['latent']
-            
+            latents_std = belief_info['latent_std']
+            latents_mean = belief_info['latent_mean']       
             next_belief_info = self.active_inference.update_belief_via_diffusion(next_observations)
             next_latents = next_belief_info['latent']
         
@@ -146,7 +139,7 @@ class DiffusionStateAgent(BaseActiveInferenceAgent):
         )  # Clip gradients of score network
         self.score_optimizer.zero_grad()
         elbo_loss, elbo_info = self.active_inference.compute_diffusion_elbo(
-            observations, normalized_rewards, latents
+            observations, rewards, latents_mean, latents_std
         )
         elbo_loss.backward()
         torch.nn.utils.clip_grad_norm_(
@@ -272,3 +265,11 @@ class DiffusionStateAgent(BaseActiveInferenceAgent):
             list(self.active_inference.reward_predictor.parameters()),
             lr=self.config.learning_rate
         )
+        # Add epistemic optimizer
+        self.epistemic_optimizer = torch.optim.AdamW(
+            self.active_inference.epistemic_estimator.parameters(),
+            lr=self.config.learning_rate*0.1,
+            weight_decay=1e-5,
+            betas=(0.9, 0.999)
+        )
+        self.active_inference.epistemic_optimizer = self.epistemic_optimizer

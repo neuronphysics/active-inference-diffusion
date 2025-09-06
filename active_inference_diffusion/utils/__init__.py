@@ -1,4 +1,4 @@
-from .buffers import ReplayBuffer
+from .buffers import ReplayBuffer, PrioritizedSequenceReplayBuffer
 from .logger import Logger
 from .training import (
     evaluate_agent,
@@ -10,6 +10,7 @@ from .training import (
 from .util import visualize_reconstruction, SpatialAttentionAggregator
 __all__ = [
     "ReplayBuffer",
+    "PrioritizedSequenceReplayBuffer",
     "Logger",
     "evaluate_agent",
     "save_checkpoint", 

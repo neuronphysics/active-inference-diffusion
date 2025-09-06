@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import numpy as np
 import torch
+wandb.login(key="25ac7dd31de2bdf846aa5c67968ecd3ba42493ac")
 class Logger:
     """
     Unified logger supporting console, file, and wandb
@@ -16,6 +17,7 @@ class Logger:
     def __init__(
         self,
         use_wandb: bool = True,
+        entity: Optional[str] = None,
         project_name: str = "active-inference",
         experiment_name: Optional[str] = None,
         config: Optional[Dict[str, Any]] = None,
@@ -29,6 +31,7 @@ class Logger:
         if use_wandb:
             wandb.init(
                 project=project_name,
+                entity=entity,
                 name=experiment_name,
                 config=config,
                 settings=wandb.Settings(init_timeout=200), 

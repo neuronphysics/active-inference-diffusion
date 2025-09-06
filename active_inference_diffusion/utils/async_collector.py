@@ -2,7 +2,7 @@
 GPU-Optimized Parallel Data Collection Architecture
 Separates environment stepping (CPU) from diffusion inference (GPU)
 """
-
+import os
 import torch
 import torch.multiprocessing as mp
 from threading import Thread, Event
@@ -22,6 +22,7 @@ GPU-Optimized Parallel Data Collection using SubprocVectorEnv
 """
 
 
+
 class GPUCentralizedCollector:
     """
     Hybrid CPU-GPU architecture using robust vectorized environments
@@ -36,7 +37,7 @@ class GPUCentralizedCollector:
         agent: Optional[Any] = None,
         num_envs: int = 8,
         max_queue_size: int = 32,
-        use_mixed_precision: bool = True,
+        use_mixed_precision: bool = False,
         use_shared_memory: bool = True  # Enable for pixel observations
     ):
         self.num_envs = num_envs
@@ -45,11 +46,15 @@ class GPUCentralizedCollector:
         self.use_shared_memory = use_shared_memory
         self._closing = False  # Add flag to track if we're closing
         self._pending_futures = []  # Track pending inference futures
-        
+        self._episode_steps = [0 for _ in range(num_envs)]  # Initialize episode steps
+        self._prev_actions =None
         # Ensure agent components are on GPU and in eval mode
         if hasattr(agent, 'active_inference'):
             agent.active_inference = agent.active_inference.to(self.device)
             agent.active_inference.eval()
+        
+        if hasattr(agent, 'epistemic_optimizer') and not hasattr(agent.active_inference, 'epistemic_optimizer'):
+                agent.active_inference.epistemic_optimizer = agent.epistemic_optimizer
             
         if hasattr(agent, 'encoder'):
             agent.encoder = agent.encoder.to(self.device)
@@ -137,12 +142,15 @@ class GPUCentralizedCollector:
         try:
             while steps_collected < num_steps and not self._closing:
                 loop_start = time.time()
-                
+                self._cleanup_futures()  # Clean up completed futures
                 # === GPU PHASE: Batched Inference ===
                 obs_batch = self._prepare_observation_batch(self.current_observations)
-                
+                frame_indices = torch.tensor(self._episode_steps, dtype=torch.long, device=self.device)
                 # Submit to GPU for diffusion + policy inference
-                inference_future = self.gpu_inference.submit_batch(obs_batch)
+                prev_actions_tensor = None
+                if self._prev_actions is not None:
+                    prev_actions_tensor = torch.tensor(self._prev_actions, dtype=torch.float32, device=self.device)
+                inference_future = self.gpu_inference.submit_batch(obs_batch, frame_indices=frame_indices, prev_actions=prev_actions_tensor)
                 self._pending_futures.append(inference_future)  # Track pending future
                 
                 # Wait for GPU to complete with timeout handling
@@ -188,7 +196,10 @@ class GPUCentralizedCollector:
                 
                 # === CPU PHASE: Parallel Environment Stepping ===
                 actions_np = actions_batch.cpu().numpy()
-                
+                if self._prev_actions is None:
+                    prev_action_ = np.zeros_like(actions_np, dtype=np.float32)
+                else:
+                    prev_action_ = self._prev_actions.copy()
                 # Validate action shape
                 if actions_np.shape[1:] != self.action_shape:
                     print(f"Warning: action shape {actions_np.shape[1:]} doesn't match expected {self.action_shape}")
@@ -215,13 +226,15 @@ class GPUCentralizedCollector:
                         actions_np[i],
                         rewards[i],
                         next_observations[i],
-                        terminateds[i] or truncateds[i]
+                        terminateds[i] or truncateds[i],
+                        frame_idx=self._episode_steps[i],
+                        prev_action=prev_action_[i]
                     )
                     
                     episode_rewards[i] += rewards[i]
                     episode_lengths[i] += 1
                     steps_collected += 1
-                    
+                    self._episode_steps[i] += 1
                     if terminateds[i] or truncateds[i]:
                         completed_episodes.append({
                             'reward': episode_rewards[i],
@@ -230,25 +243,44 @@ class GPUCentralizedCollector:
                         })
                         episode_rewards[i] = 0.0
                         episode_lengths[i] = 0
-                
+                        self._episode_steps[i] = 0  # Reset step count for this env
+                        if self._prev_actions is not None:
+                           self._prev_actions[i] = np.zeros(self.action_shape[0])
                 # Update observations for next iteration
                 self.current_observations = next_observations
-                
+                self._prev_actions = actions_np.copy()
                 # Log performance every 100 steps
                 if steps_collected % 100 == 0:
                     self._log_performance()
+                if steps_collected % 1000 == 0:
+                    print(f"Collected {steps_collected} steps in {time.time() - loop_start:.2f}s")
+                    torch.cuda.empty_cache()  # Clear GPU memory to avoid fragmentation
                 
         except Exception as e:
             print(f"Error in collection loop: {e}")
             traceback.print_exc()
             raise
         finally:
+            self._cleanup_all_futures()  # Ensure all futures are cleaned up
             self.gpu_inference.stop()
         
         # Compute final statistics
-        stats = self._compute_statistics(steps_collected, completed_episodes)
-        return stats
+        return self._compute_statistics(steps_collected, completed_episodes)
         
+    def _cleanup_futures(self):
+        """Remove completed futures from tracking list"""
+        self._pending_futures = [f for f in self._pending_futures 
+                                if not f.ready.is_set()]
+
+    def _cleanup_all_futures(self):
+        """Cancel and remove all pending futures"""
+        for future in self._pending_futures:
+            try:
+                future.cancel()
+            except:
+                pass
+        self._pending_futures.clear()
+
     def _prepare_observation_batch(self, observations: np.ndarray) -> torch.Tensor:
         """
         Convert numpy observations to GPU tensor with proper handling
@@ -364,7 +396,10 @@ class AsyncGPUInference:
         self.inference_queue = Queue(maxsize=max_queue_size)
         self.result_queue = Queue(maxsize=max_queue_size)
         self.shutdown_event = Event()
-        
+        self.inference_steps = agent.config.diffusion.inference_steps
+        self.ddim_eta = agent.config.diffusion.ddim_eta
+        self.use_ddim = (self.inference_steps is not None and 
+                 self.inference_steps < agent.config.diffusion.num_diffusion_steps)
         # CUDA optimization
         self.inference_stream = torch.cuda.Stream()
         self.scaler = torch.cuda.amp.GradScaler() if use_mixed_precision else None
@@ -406,16 +441,21 @@ class AsyncGPUInference:
             if self.gpu_thread.is_alive():
                 print("Warning: GPU inference thread did not shut down cleanly")
     
-    def submit_batch(self, observations_batch: torch.Tensor) -> 'InferenceFuture':
+    def submit_batch(self, observations_batch: torch.Tensor,
+                     frame_indices: Optional[torch.Tensor] = None,
+                     prev_actions: Optional[torch.Tensor] = None) -> 'InferenceFuture':
         """Submit observation batch for GPU inference"""
         future = InferenceFuture()
-        
+        if frame_indices is not None:
+            frame_indices = frame_indices.to(observations_batch.device)
+        if prev_actions is not None:
+            prev_actions = prev_actions.to(observations_batch.device)
         try:
-            self.inference_queue.put((observations_batch, future), timeout=1.0)
+            self.inference_queue.put((observations_batch, frame_indices, prev_actions, future), timeout=1.0)
         except:
             # Queue full - return dummy actions
             print("Inference queue full, returning dummy actions")
-            dummy_actions = torch.zeros(observations_batch.shape[0], self.action_dim)
+            dummy_actions = torch.zeros(observations_batch.shape[0], self.action_dim, device=observations_batch.device)
             future.set_result(dummy_actions)
             
         return future
@@ -436,9 +476,9 @@ class AsyncGPUInference:
                     
                 if batch_item is None:  # Shutdown sentinel
                     break
-                    
-                observations_batch, future = batch_item
-                
+
+                observations_batch, frame_indices, prev_actions, future = batch_item
+
                 # Skip if future already cancelled
                 if hasattr(future, 'cancelled') and future.cancelled:
                     continue
@@ -449,9 +489,9 @@ class AsyncGPUInference:
                     # Execute batched diffusion inference on GPU
                     if torch.cuda.is_available():
                         with torch.cuda.stream(self.inference_stream):
-                            actions_batch = self._batched_diffusion_inference(observations_batch)
+                            actions_batch = self._batched_diffusion_inference(observations_batch, frame_indices, prev_actions)
                     else:
-                        actions_batch = self._batched_diffusion_inference(observations_batch)
+                        actions_batch = self._batched_diffusion_inference(observations_batch, frame_indices, prev_actions)
                     
                     # Performance tracking
                     inference_time = time.time() - start_time
@@ -482,30 +522,41 @@ class AsyncGPUInference:
                 traceback.print_exc()
                 
         print("GPU inference worker stopped")
-        
-    def _batched_diffusion_inference(self, observations_batch: torch.Tensor) -> torch.Tensor:
+
+    def _batched_diffusion_inference(self, 
+                                     observations_batch: torch.Tensor, 
+                                     frame_indices: Optional[torch.Tensor] = None, 
+                                     prev_actions: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Vectorized diffusion inference across entire observation batch
         Core optimization: Single GPU call for all environments
         """
         batch_size = observations_batch.shape[0]
-        
+        device = observations_batch.device
+        if frame_indices is not None:
+            frame_indices = frame_indices.to(device)
+        if prev_actions is not None:
+            prev_actions = prev_actions.to(device)
         try:
             with torch.no_grad():
+                
+
                 if self.use_mixed_precision and torch.cuda.is_available():
                     with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                        actions_batch = self._inference_impl(observations_batch, batch_size)
+                        actions_batch = self._inference_impl(observations_batch, batch_size, frame_indices, prev_actions)
                 else:
-                    actions_batch = self._inference_impl(observations_batch, batch_size)
-                    
+                    actions_batch = self._inference_impl(observations_batch, batch_size, frame_indices, prev_actions)
+
             return actions_batch.float()
             
         except Exception as e:
             print(f"Error in batched diffusion inference: {e}")
             # Return random actions as fallback
-            return torch.randn(batch_size, self.action_dim, device=observations_batch.device) * 0.1
+            return torch.randn(batch_size, self.action_dim, device=device) * 0.1
      
-    def _inference_impl(self, observations_batch: torch.Tensor, batch_size: int) -> torch.Tensor:
+    def _inference_impl(self, observations_batch: torch.Tensor, batch_size: int,
+                        frame_indices: Optional[torch.Tensor] = None, 
+                        prev_actions: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Implementation of inference logic"""
         # Encode observations (if pixel-based)
         if hasattr(self.agent, 'encoder'):
@@ -516,7 +567,11 @@ class AsyncGPUInference:
         # Batched belief generation via reverse diffusion
         latents_batch = self._batch_diffusion_sampling(
             encoded_obs, 
-            num_steps=self.max_diffusion_steps
+            num_steps=self.inference_steps if self.use_ddim else self.max_diffusion_steps,
+            use_ddim=self.use_ddim,
+            eta=self.ddim_eta,
+            frame_indices=frame_indices,
+            actions=prev_actions
         )
         
         # Batched policy evaluation
@@ -530,7 +585,11 @@ class AsyncGPUInference:
     def _batch_diffusion_sampling(
         self, 
         observations_batch: torch.Tensor,
-        num_steps: Optional[int] = None
+        num_steps: Optional[int] = None,
+        use_ddim: bool = False,
+        eta: float = 0.0,
+        frame_indices: Optional[torch.Tensor] = None,
+        actions: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Optimized batched reverse diffusion with reduced steps
@@ -538,6 +597,17 @@ class AsyncGPUInference:
         """
         batch_size = observations_batch.shape[0]
         latent_dim = self.agent.config.latent_dim
+
+        if frame_indices is not None:
+            if isinstance(frame_indices, np.ndarray):
+                frame_indices = torch.tensor(frame_indices, dtype=torch.long, device=observations_batch.device)
+            else:
+                frame_indices = frame_indices.to(observations_batch.device)
+        if actions is not None:
+            if isinstance(actions, np.ndarray):
+                actions = torch.tensor(actions, dtype=torch.float32, device=observations_batch.device)
+            else:
+                actions = actions.to(observations_batch.device)
         if num_steps is None:
             num_steps = self.max_diffusion_steps
         else:
@@ -575,23 +645,21 @@ class AsyncGPUInference:
             if hasattr(self.agent.active_inference.latent_diffusion, 'continuous_time') and \
                self.agent.active_inference.latent_diffusion.continuous_time:
                 t_continuous = t_batch.float() / max_index
-                score_batch = self.agent.active_inference.latent_score_network(
-                    z_batch, t_continuous, observations_batch
-                )
+                with torch.no_grad():
+                    score_batch = self.agent.active_inference.latent_score_network(z_batch.detach(), t_continuous, observations_batch, frame_time=frame_indices, action=actions)
             else:
                 # Use clamped long indices for discrete time
-                score_batch = self.agent.active_inference.latent_score_network(
-                    z_batch, t_batch_long.float(), observations_batch
-                )
-            
+                with torch.no_grad():
+                    score_batch = self.agent.active_inference.latent_score_network(z_batch.detach(), t_batch_long.float(), observations_batch, frame_time=frame_indices, action=actions)
+
             # Use clamped long indices for diffusion update
-            z_batch = self.agent.active_inference.latent_diffusion.p_sample(
-                z_batch, t_batch_long, score_batch, deterministic=False
-            )
+            z_batch = self.agent.active_inference.latent_diffusion.p_sample(z_batch.detach(), t_batch_long, score_batch, deterministic=False)
+            z_batch = z_batch.detach()  # Detach to avoid gradients accumulating
             if torch.isnan(z_batch).any() or torch.isinf(z_batch).any():
                 print(f"NaN/Inf detected at diffusion step {step}, reinitializing")
-                z_batch = torch.randn_like(z_batch) * 0.1
-        
+                z_batch = torch.randn_like(z_batch, device=z_batch.device) * 0.1
+            del score_batch  # Free memory
+            torch.cuda.empty_cache()  # Clear cache to avoid fragmentation
         return z_batch
 
 
